@@ -413,14 +413,10 @@ async function initWebgazer() {
   // an earlier session (e.g. from testing before this fix existed).
   try { webgazer.clearData(); } catch (e) { /* non-fatal */ }
 
-  // Stop WebGazer's built-in behavior of continuing to "learn" from every
-  // click and mouse movement after begin(). All calibration in this app
-  // happens deliberately, via recordScreenPosition() calls tied to known
-  // dot coordinates — leaving the automatic listeners on means moving your
-  // mouse toward an answer button (while your eyes are still on the
-  // passage) silently feeds that mismatch back into the model, drifting it
-  // away from the calibration you just did.
-  try { webgazer.removeMouseEventListeners(); } catch (e) { /* non-fatal */ }
+  // NOTE: WebGazer's native click-listener is deliberately left ON here —
+  // it's the verified-working training mechanism, and calibration below
+  // relies on it (via synthetic dispatched clicks). It gets turned off
+  // once calibration is actually done — see freezeCalibration() below.
 
   const preview = document.querySelector('#webgazerVideoContainer');
   if (preview) document.getElementById('video-preview-wrap').appendChild(preview);
@@ -482,10 +478,18 @@ function showCalibPoint() {
   calibHint.textContent = `Point ${state.calibIndex + 1} of ${CALIB_POINTS.length} — just look at the dot`;
   calibOverlay.appendChild(dot);
 
-  // No click required: discard the settle window (eyes still moving toward
-  // the dot), then periodically feed WebGazer the dot's exact center as
-  // ground truth while the person looks at it, for the rest of the dwell
-  // time. The dot then disappears and the next one appears automatically.
+  // No physical click required from you: discard the settle window (eyes
+  // still moving toward the dot), then repeatedly feed WebGazer a training
+  // sample at the dot's exact center for the rest of the dwell time. Two
+  // mechanisms run together here, deliberately redundant:
+  //  1. recordScreenPosition() — the documented API for manually injecting
+  //     a training sample.
+  //  2. a synthetic 'click' MouseEvent dispatched at the same coordinates —
+  //     this exercises WebGazer's own native, click-driven training path
+  //     (the one that's been reliably verified to work), just without you
+  //     having to actually press anything.
+  // Having both means calibration still works even if one of the two turns
+  // out not to behave as expected in a given WebGazer build.
   setTimeout(() => {
     const r = dot.getBoundingClientRect();
     const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
@@ -494,6 +498,11 @@ function showCalibPoint() {
       if (typeof webgazer !== 'undefined' && webgazer.recordScreenPosition) {
         try { webgazer.recordScreenPosition(cx, cy, 'click'); } catch (e) { /* non-fatal */ }
       }
+      try {
+        document.dispatchEvent(new MouseEvent('click', {
+          bubbles: true, cancelable: true, clientX: cx, clientY: cy
+        }));
+      } catch (e) { /* non-fatal */ }
     }, CONFIG.CALIBRATION_RECORD_INTERVAL_MS);
 
     setTimeout(() => {
@@ -567,11 +576,24 @@ function finishAccuracyCheck() {
   document.getElementById('accuracy-result').style.display = 'block';
 }
 
-document.getElementById('btn-accuracy-continue').addEventListener('click', startItem);
+document.getElementById('btn-accuracy-continue').addEventListener('click', () => {
+  freezeCalibration();
+  startItem();
+});
 document.getElementById('btn-accuracy-recalibrate').addEventListener('click', () => {
   state.calibIndex = 0;
   showCalibPoint();
 });
+
+// Calibration is genuinely finished — stop WebGazer's built-in habit of
+// continuing to "learn" from every click and mouse movement from here on.
+// It stayed on through calibration deliberately (see showCalibPoint()); if
+// it stayed on during the reading task too, moving your mouse toward an
+// answer button while still reading would keep feeding that mismatch back
+// into the model, drifting it away from the calibration you just did.
+function freezeCalibration() {
+  try { webgazer.removeMouseEventListeners(); } catch (e) { /* non-fatal */ }
+}
 
 /* =========================================================================
    READING TASK
@@ -695,7 +717,7 @@ function handleAnswer(answerGiven) {
     ? fixations.reduce((a, f) => a + f.duration, 0) / fixations.length
     : 0;
   const offPassageFraction = fixations.length
-    ? offPassageCount / (fixations.length + offPassageCount)
+    ? offPassageCount / fixations.length
     : 1;
 
   const stats = {
