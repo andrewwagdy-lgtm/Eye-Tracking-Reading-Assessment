@@ -392,6 +392,11 @@ async function initWebgazer() {
   webgazer
     .setRegression('ridge')
     .setTracker('TFFacemesh')   // the only tracker this WebGazer build supports
+    // Smooths frame-to-frame prediction jitter (the raw signal is naturally
+    // noisy — every video frame's eye-feature estimate wobbles slightly even
+    // when your gaze is genuinely steady). This affects the actual gaze data
+    // used for fixation detection, not just the visible dot's smoothness.
+    .applyKalmanFilter(true)
     // Never blend in training data saved by a PREVIOUS browser session. Without
     // this, webgazer.begin() auto-loads whatever calibration data localStorage
     // has left over (different seating, lighting, even a different day) and
