@@ -94,10 +94,11 @@
 
   /* Reading passage */
   .passage {
-    font-size: 24px; line-height: 3.2; padding: 22px; border: 1px solid var(--line);
-    border-radius: 8px; background: #fff; max-height: 50vh; overflow: hidden;
+    font-size: 24px; line-height: 4.2; word-spacing: 14px; padding: 22px;
+    border: 1px solid var(--line); border-radius: 8px; background: #fff;
+    max-height: 55vh; overflow: hidden;
   }
-  .word { padding: 5px 3px; border-radius: 3px; }
+  .word { padding: 6px 4px; border-radius: 3px; }
   .options { margin-top: 18px; display: grid; gap: 8px; }
   .opt-btn {
     background: #fff; color: var(--ink); border: 1px solid var(--line);
@@ -257,7 +258,7 @@ const CONFIG = {
   LOOKBACK_WINDOW_MS: 8000,
   FIXATION_MIN_DURATION_MS: 150,
   FIXATION_DISPERSION_PX: 60,
-  WORD_HIT_RADIUS_PX: 70   // max distance from a fixation to still count as "on" a word
+  WORD_HIT_RADIUS_PX: 50   // max distance from a fixation to still count as "on" a word
 };
 
 // 13-point grid: the original 3x3 plus four inner quadrant points, for
