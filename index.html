@@ -256,9 +256,10 @@ const CONFIG = {
   ACCURACY_SETTLE_MS: 400,     // discard samples in this window after a target appears — eyes are still saccading toward it
   ACCURACY_SAMPLE_MS: 1200,    // then sample for this long
   LOOKBACK_WINDOW_MS: 8000,
+  GAZE_SMOOTHING_ALPHA: 0.25,  // exponential smoothing on the raw gaze stream — lower = smoother but more lag, higher = more responsive but jittery. 1 = no smoothing.
   FIXATION_MIN_DURATION_MS: 150,
-  FIXATION_DISPERSION_PX: 60,
-  WORD_HIT_RADIUS_PX: 50   // max distance from a fixation to still count as "on" a word
+  FIXATION_DISPERSION_PX: 70,  // how much scatter is still considered "one fixation" — loosened to tolerate residual jitter after smoothing
+  WORD_HIT_RADIUS_PX: 60   // max distance from a fixation to still count as "on" a word
 };
 
 // 13-point grid: the original 3x3 plus four inner quadrant points, for
@@ -654,9 +655,24 @@ function startItem() {
   showScreen('screen-reading');
 
   state.passageStartT = performance.now();
+
+  // Exponential smoothing on the raw gaze stream: each new point is pulled
+  // partway toward WebGazer's raw prediction rather than replacing the
+  // previous point outright. This is a second, more aggressive smoothing
+  // pass on top of WebGazer's own Kalman filter, and — unlike that one —
+  // it's ours to tune (GAZE_SMOOTHING_ALPHA in CONFIG). Only the SMOOTHED
+  // point is stored, so fixation detection and word-mapping both benefit.
+  let smoothX = null, smoothY = null;
   webgazer.setGazeListener((data) => {
     if (!data) return;
-    state.gazeBuffer.push({ x: data.x, y: data.y, t: performance.now() - state.passageStartT });
+    if (smoothX === null) {
+      smoothX = data.x; smoothY = data.y;
+    } else {
+      const a = CONFIG.GAZE_SMOOTHING_ALPHA;
+      smoothX = a * data.x + (1 - a) * smoothX;
+      smoothY = a * data.y + (1 - a) * smoothY;
+    }
+    state.gazeBuffer.push({ x: smoothX, y: smoothY, t: performance.now() - state.passageStartT });
   });
 }
 
