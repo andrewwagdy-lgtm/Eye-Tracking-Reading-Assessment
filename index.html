@@ -392,6 +392,12 @@ async function initWebgazer() {
   webgazer
     .setRegression('ridge')
     .setTracker('TFFacemesh')   // the only tracker this WebGazer build supports
+    // Never blend in training data saved by a PREVIOUS browser session. Without
+    // this, webgazer.begin() auto-loads whatever calibration data localStorage
+    // has left over (different seating, lighting, even a different day) and
+    // merges it with this session's — diluting a good calibration with a
+    // stale one. Each session in this app should start from a clean slate.
+    .saveDataAcrossSessions(false)
     .showVideoPreview(true)
     .showPredictionPoints(false)
     .showFaceOverlay(false)
@@ -402,6 +408,19 @@ async function initWebgazer() {
     setTimeout(() => reject(new Error('WebGazer did not start within 15s — camera permission denied, or blocked by the browser.')), 15000)
   );
   await Promise.race([beginPromise, timeout]);
+
+  // Belt-and-suspenders: wipe anything already sitting in localStorage from
+  // an earlier session (e.g. from testing before this fix existed).
+  try { webgazer.clearData(); } catch (e) { /* non-fatal */ }
+
+  // Stop WebGazer's built-in behavior of continuing to "learn" from every
+  // click and mouse movement after begin(). All calibration in this app
+  // happens deliberately, via recordScreenPosition() calls tied to known
+  // dot coordinates — leaving the automatic listeners on means moving your
+  // mouse toward an answer button (while your eyes are still on the
+  // passage) silently feeds that mismatch back into the model, drifting it
+  // away from the calibration you just did.
+  try { webgazer.removeMouseEventListeners(); } catch (e) { /* non-fatal */ }
 
   const preview = document.querySelector('#webgazerVideoContainer');
   if (preview) document.getElementById('video-preview-wrap').appendChild(preview);
@@ -808,6 +827,10 @@ document.getElementById('btn-next-item').addEventListener('click', () => {
    ========================================================================= */
 function endSession() {
   webgazer.end();
+  // webgazer.end() auto-saves this session's training data to localStorage.
+  // Wipe it immediately so it can never bleed into a future session, even
+  // though saveDataAcrossSessions(false) should already stop it being loaded.
+  try { webgazer.clearData(); } catch (e) { /* non-fatal */ }
   showScreen('screen-done');
 }
 
