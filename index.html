@@ -165,9 +165,9 @@
   <!-- CALIBRATION INSTRUCTIONS -->
   <section class="screen" id="screen-calib-intro">
     <div class="card">
-      <h2>Calibration (30–60 seconds)</h2>
-      <p>Nine dots will appear one at a time. Look directly at each dot and
-         <strong>click it 5 times</strong> before moving to the next. This teaches the
+      <h2>Calibration (about 1 minute)</h2>
+      <p>13 dots will appear one at a time, each for 5 seconds. Just
+         <strong>look steadily at each dot</strong> — no clicking needed. This teaches the
          system to map your gaze to screen position for this seat and lighting.</p>
       <div class="btn-row">
         <button id="btn-start-calib">Start calibration</button>
@@ -248,7 +248,9 @@
    ========================================================================= */
 const CONFIG = {
   WEBAPP_URL: 'https://script.google.com/macros/s/AKfycbyuzG9JUz6ghl2ItzCxzFaXSipUqSn01url2qo7lbrJ9zVKoOMet_iQzaAZL6aJEUVG/exec',
-  CALIBRATION_CLICKS_PER_POINT: 8,
+  CALIBRATION_DWELL_MS: 5000,        // how long each calibration dot stays on screen
+  CALIBRATION_SETTLE_MS: 500,        // discard this much time after a dot appears — eyes are still moving toward it
+  CALIBRATION_RECORD_INTERVAL_MS: 150, // how often to feed WebGazer a training sample during dwell
   ACCURACY_THRESHOLD_PX: 200,
   ACCURACY_SETTLE_MS: 400,     // discard samples in this window after a target appears — eyes are still saccading toward it
   ACCURACY_SAMPLE_MS: 1200,    // then sample for this long
@@ -282,7 +284,6 @@ const state = {
   items: [],
   itemIndex: 0,
   calibIndex: 0,
-  calibClicks: 0,
   gazeBuffer: [],       // {x,y,t} t = ms since passage shown, for the CURRENT item
   passageStartT: 0,
   wordEls: [],
@@ -440,7 +441,7 @@ function showCalibPoint() {
   calibOverlay.classList.add('active');
   // The webcam preview box sits in the bottom-right corner and can cover a
   // calibration dot there — hide it for the duration of calibration so
-  // every dot is guaranteed clickable, then restore it afterward.
+  // every dot is guaranteed visible, then restore it afterward.
   document.getElementById('video-preview-wrap').style.display = 'none';
   showScreen('screen-calib-intro'); // keep underlying screen consistent while overlay is up
   document.querySelectorAll('.calib-dot').forEach(d => d.remove());
@@ -457,26 +458,30 @@ function showCalibPoint() {
   dot.className = 'calib-dot';
   dot.style.left = xPct + 'vw';
   dot.style.top = yPct + 'vh';
-  state.calibClicks = 0;
-  calibHint.textContent = `Point ${state.calibIndex + 1} of ${CALIB_POINTS.length} — click ${CONFIG.CALIBRATION_CLICKS_PER_POINT} times`;
-
-  dot.addEventListener('click', () => {
-    state.calibClicks++;
-    // Feed WebGazer the dot's exact geometric center, not just the raw click
-    // pixel (which can be a few px off if the click lands slightly away from
-    // center) — this is the ground-truth target the person was looking at.
-    if (typeof webgazer !== 'undefined' && webgazer.recordScreenPosition) {
-      const r = dot.getBoundingClientRect();
-      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-      try { webgazer.recordScreenPosition(cx, cy, 'click'); } catch (e) { /* non-fatal */ }
-    }
-    if (state.calibClicks >= CONFIG.CALIBRATION_CLICKS_PER_POINT) {
-      dot.classList.add('done');
-      setTimeout(() => { state.calibIndex++; showCalibPoint(); }, 150);
-    }
-  });
-
+  dot.style.cursor = 'default';
+  calibHint.textContent = `Point ${state.calibIndex + 1} of ${CALIB_POINTS.length} — just look at the dot`;
   calibOverlay.appendChild(dot);
+
+  // No click required: discard the settle window (eyes still moving toward
+  // the dot), then periodically feed WebGazer the dot's exact center as
+  // ground truth while the person looks at it, for the rest of the dwell
+  // time. The dot then disappears and the next one appears automatically.
+  setTimeout(() => {
+    const r = dot.getBoundingClientRect();
+    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+
+    const recordInterval = setInterval(() => {
+      if (typeof webgazer !== 'undefined' && webgazer.recordScreenPosition) {
+        try { webgazer.recordScreenPosition(cx, cy, 'click'); } catch (e) { /* non-fatal */ }
+      }
+    }, CONFIG.CALIBRATION_RECORD_INTERVAL_MS);
+
+    setTimeout(() => {
+      clearInterval(recordInterval);
+      state.calibIndex++;
+      showCalibPoint();
+    }, CONFIG.CALIBRATION_DWELL_MS - CONFIG.CALIBRATION_SETTLE_MS);
+  }, CONFIG.CALIBRATION_SETTLE_MS);
 }
 
 /* =========================================================================
