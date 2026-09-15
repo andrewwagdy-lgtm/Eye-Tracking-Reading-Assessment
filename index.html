@@ -259,7 +259,15 @@ const CONFIG = {
   GAZE_SMOOTHING_ALPHA: 0.25,  // exponential smoothing on the raw gaze stream — lower = smoother but more lag, higher = more responsive but jittery. 1 = no smoothing.
   FIXATION_MIN_DURATION_MS: 150,
   FIXATION_DISPERSION_PX: 70,  // how much scatter is still considered "one fixation" — loosened to tolerate residual jitter after smoothing
-  WORD_HIT_RADIUS_PX: 60   // max distance from a fixation to still count as "on" a word
+
+  // Individual words often sit closer together than a webcam eye tracker's
+  // real accuracy — no amount of smoothing changes that. So the heat map
+  // maps fixations to WORD CLUSTERS (phrase-level regions), each sized to
+  // be comfortably wider than this session's own measured tracking error
+  // (from the accuracy check), rather than to single words.
+  CLUSTER_WIDTH_ERROR_FACTOR: 2,     // cluster width >= measured error * this factor
+  CLUSTER_WIDTH_FLOOR_PX: 120,       // ...but never narrower than this, even with a great accuracy score
+  CLUSTER_HIT_MARGIN_PX: 30          // extra tolerance beyond a cluster's own rectangle before it's "off-passage"
 };
 
 // 13-point grid: the original 3x3 plus four inner quadrant points, for
@@ -290,7 +298,8 @@ const state = {
   passageStartT: 0,
   wordEls: [],
   currentItem: null,
-  fullSessionLog: []    // every submitted response, kept client-side for the download button
+  fullSessionLog: [],   // every submitted response, kept client-side for the download button
+  accuracyErrorPx: null // this session's measured tracking error, from the accuracy check — sizes heat-map clusters
 };
 
 function makeId() {
@@ -588,6 +597,10 @@ function finishAccuracyCheck() {
 
   const valid = accuracyPointResults.filter(e => e !== null && isFinite(e));
   const meanError = valid.length ? valid.reduce((a, b) => a + b, 0) / valid.length : Infinity;
+  // Remember this session's own measured accuracy — the heat map uses it to
+  // size word clusters to something the tracker can actually resolve,
+  // rather than guessing a fixed size for everyone.
+  state.accuracyErrorPx = isFinite(meanError) ? meanError : null;
 
   document.getElementById('accuracy-px').textContent = isFinite(meanError) ? Math.round(meanError) : 'no data';
   document.getElementById('accuracy-instructions').style.display = 'none';
@@ -703,15 +716,62 @@ function detectFixations(points, minDurationMs, dispersionPx) {
   return fixations;
 }
 
-function nearestWordIndex(x, y) {
-  let bestIdx = -1, bestDist = CONFIG.WORD_HIT_RADIUS_PX;
+// Groups the passage's word spans (left-to-right, same visual line) into
+// clusters whose combined width is at least minWidthPx — i.e. regions wide
+// enough for this session's own measured tracking error to reliably land
+// inside the right one, rather than one of its neighbors. Recomputed fresh
+// each time it's called (mirrors how word rects were always re-read live),
+// so it stays correct even if layout shifted slightly.
+function buildWordClusters(minWidthPx) {
+  const clusters = [];
+  const wordToCluster = [];
+  let curWords = null, curTop = null, curBottom = null, curLeft = null, curRight = null;
+
+  function flush() {
+    if (curWords && curWords.length) {
+      clusters.push({ wordIndices: curWords, left: curLeft, right: curRight, top: curTop, bottom: curBottom });
+    }
+  }
+
   state.wordEls.forEach((el, idx) => {
     const r = el.getBoundingClientRect();
-    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-    const d = Math.hypot(x - cx, y - cy);
-    if (d < bestDist) { bestDist = d; bestIdx = idx; }
+    const sameLine = curTop !== null && Math.abs(r.top - curTop) < 8;
+    const stillGrowing = sameLine && (curRight - curLeft) < minWidthPx;
+
+    if (curWords && stillGrowing) {
+      curWords.push(idx);
+      curRight = Math.max(curRight, r.right);
+      curBottom = Math.max(curBottom, r.bottom);
+    } else {
+      flush();
+      curWords = [idx];
+      curTop = r.top; curBottom = r.bottom; curLeft = r.left; curRight = r.right;
+    }
+    wordToCluster[idx] = clusters.length; // index this word will belong to once flushed
+  });
+  flush();
+
+  return { clusters, wordToCluster };
+}
+
+// Distance from (x, y) to the nearest point ON a cluster's rectangle (0 if
+// inside it) — more appropriate than center-to-point distance for wide
+// rectangular regions, where a fixation near the edge of a long cluster
+// shouldn't be penalized as if the cluster were a single small point.
+function nearestClusterIndex(x, y, clusters) {
+  let bestIdx = -1, bestDist = CONFIG.CLUSTER_HIT_MARGIN_PX;
+  clusters.forEach((c, i) => {
+    const nx = Math.max(c.left, Math.min(x, c.right));
+    const ny = Math.max(c.top, Math.min(y, c.bottom));
+    const d = Math.hypot(x - nx, y - ny);
+    if (d < bestDist) { bestDist = d; bestIdx = i; }
   });
   return bestIdx; // -1 = off-passage
+}
+
+function currentMinClusterWidthPx() {
+  const errorPx = state.accuracyErrorPx || (CONFIG.CLUSTER_WIDTH_FLOOR_PX / CONFIG.CLUSTER_WIDTH_ERROR_FACTOR);
+  return Math.max(CONFIG.CLUSTER_WIDTH_FLOOR_PX, errorPx * CONFIG.CLUSTER_WIDTH_ERROR_FACTOR);
 }
 
 /* =========================================================================
@@ -722,29 +782,37 @@ function handleAnswer(answerGiven) {
   const answerTimeMs = performance.now() - state.passageStartT;
   const item = state.currentItem;
 
+  const minWidthPx = currentMinClusterWidthPx();
+  const { clusters, wordToCluster } = buildWordClusters(minWidthPx);
+
   const lookbackStart = Math.max(0, answerTimeMs - CONFIG.LOOKBACK_WINDOW_MS);
   const windowPoints = state.gazeBuffer.filter(p => p.t >= lookbackStart && p.t <= answerTimeMs);
   const fixations = detectFixations(windowPoints, CONFIG.FIXATION_MIN_DURATION_MS, CONFIG.FIXATION_DISPERSION_PX);
 
-  // Map each fixation to a word (or off-passage), track dwell time per word and regressions.
-  const dwellByWord = {};
+  // Map each fixation to a word CLUSTER (or off-passage), track dwell time
+  // per cluster and regressions (a regression is now "back to an earlier
+  // cluster", same idea as before just at the coarser, more trustworthy
+  // resolution).
+  const dwellByCluster = {};
   let offPassageCount = 0;
   let runningMaxIdx = -1;
   let regressionCount = 0;
 
   fixations.forEach(f => {
-    const idx = nearestWordIndex(f.x, f.y);
+    const idx = nearestClusterIndex(f.x, f.y, clusters);
     if (idx === -1) { offPassageCount++; return; }
-    dwellByWord[idx] = (dwellByWord[idx] || 0) + f.duration;
+    dwellByCluster[idx] = (dwellByCluster[idx] || 0) + f.duration;
     if (idx < runningMaxIdx) regressionCount++;
     runningMaxIdx = Math.max(runningMaxIdx, idx);
   });
 
   let topIdx = -1, topDwellMs = 0;
-  Object.entries(dwellByWord).forEach(([idx, ms]) => {
+  Object.entries(dwellByCluster).forEach(([idx, ms]) => {
     if (ms > topDwellMs) { topDwellMs = ms; topIdx = Number(idx); }
   });
-  const topDwellWord = topIdx >= 0 ? state.wordEls[topIdx].textContent : null;
+  const topDwellWord = topIdx >= 0
+    ? clusters[topIdx].wordIndices.map(i => state.wordEls[i].textContent).join(' ')
+    : null;
 
   const avgFixationDurationMs = fixations.length
     ? fixations.reduce((a, f) => a + f.duration, 0) / fixations.length
@@ -762,13 +830,22 @@ function handleAnswer(answerGiven) {
   const classification = classifyPattern(stats);
   const isCorrect = String(answerGiven).trim().toLowerCase() === String(item.correctAnswer).trim().toLowerCase();
 
-  // Full-session (whole item) dwell, for the heat map — separate from the lookback stats above.
+  // Full-session (whole item) dwell, for the heat map — separate from the
+  // lookback stats above, but mapped through the same clusters.
   const allFixations = detectFixations(state.gazeBuffer, CONFIG.FIXATION_MIN_DURATION_MS, CONFIG.FIXATION_DISPERSION_PX);
-  const fullDwellByWord = {};
+  const fullDwellByCluster = {};
   allFixations.forEach(f => {
-    const idx = nearestWordIndex(f.x, f.y);
+    const idx = nearestClusterIndex(f.x, f.y, clusters);
     if (idx === -1) return;
-    fullDwellByWord[idx] = (fullDwellByWord[idx] || 0) + f.duration;
+    fullDwellByCluster[idx] = (fullDwellByCluster[idx] || 0) + f.duration;
+  });
+  // Expand cluster-level dwell back out to per-word dwell for rendering —
+  // every word in a highlighted cluster gets the same shade, so the heat
+  // map reads as highlighted PHRASES rather than isolated single words.
+  const fullDwellByWord = {};
+  clusters.forEach((c, ci) => {
+    const dwell = fullDwellByCluster[ci] || 0;
+    if (dwell > 0) c.wordIndices.forEach(wi => { fullDwellByWord[wi] = dwell; });
   });
 
   renderResult(item, answerGiven, isCorrect, answerTimeMs, stats, classification, fullDwellByWord);
@@ -821,7 +898,7 @@ function classifyPattern(stats) {
       label: 'Vocabulary slip',
       explanation: `In the ${secs}s before answering, gaze concentrated heavily on "${stats.topDwellWord}" ` +
         `(${Math.round(stats.topDwellMs)}ms dwell, well above the ${Math.round(stats.avgFixationDurationMs)}ms ` +
-        `average fixation) with little backtracking — consistent with a single lexical item driving the answer.`
+        `average fixation) with little backtracking — consistent with that part of the text driving the answer.`
     };
   }
   return {
@@ -866,7 +943,7 @@ function renderResult(item, answerGiven, isCorrect, answerTimeMs, stats, classif
   document.getElementById('result-stats').innerHTML = `
     <div><b>${stats.fixationCount}</b>fixations in window</div>
     <div><b>${stats.regressionCount}</b>regressions</div>
-    <div><b>${stats.topDwellWord || '—'}</b>top-dwell word</div>
+    <div><b>${stats.topDwellWord || '—'}</b>top-dwell phrase</div>
   `;
 
   showScreen('screen-result');
