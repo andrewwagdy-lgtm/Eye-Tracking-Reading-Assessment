@@ -251,7 +251,7 @@ const CONFIG = {
   WEBAPP_URL: 'https://script.google.com/macros/s/AKfycbyuzG9JUz6ghl2ItzCxzFaXSipUqSn01url2qo7lbrJ9zVKoOMet_iQzaAZL6aJEUVG/exec',
   CALIBRATION_DWELL_MS: 5000,        // how long each calibration dot stays on screen
   CALIBRATION_SETTLE_MS: 500,        // discard this much time after a dot appears — eyes are still moving toward it
-  CALIBRATION_RECORD_INTERVAL_MS: 150, // how often to feed WebGazer a training sample during dwell
+  CALIBRATION_SAMPLES_PER_POINT: 8,  // fixed, small count per point — NOT a continuous stream (see showCalibPoint)
   ACCURACY_THRESHOLD_PX: 200,
   ACCURACY_SETTLE_MS: 400,     // discard samples in this window after a target appears — eyes are still saccading toward it
   ACCURACY_SAMPLE_MS: 1200,    // then sample for this long
@@ -486,37 +486,42 @@ function showCalibPoint() {
   calibOverlay.appendChild(dot);
 
   // No physical click required from you: discard the settle window (eyes
-  // still moving toward the dot), then repeatedly feed WebGazer a training
-  // sample at the dot's exact center for the rest of the dwell time. Two
-  // mechanisms run together here, deliberately redundant:
-  //  1. recordScreenPosition() — the documented API for manually injecting
-  //     a training sample.
-  //  2. a synthetic 'click' MouseEvent dispatched at the same coordinates —
-  //     this exercises WebGazer's own native, click-driven training path
-  //     (the one that's been reliably verified to work), just without you
-  //     having to actually press anything.
-  // Having both means calibration still works even if one of the two turns
-  // out not to behave as expected in a given WebGazer build.
+  // still moving toward the dot), then dispatch a FIXED, SMALL number of
+  // synthetic clicks at the dot's exact center, spaced evenly across the
+  // rest of the dwell time — deliberately mirroring the density of the
+  // original manual "click 8 times" design, not a continuous stream.
+  //
+  // Earlier versions of this file fired training samples every 150ms via
+  // TWO mechanisms at once (recordScreenPosition + a synthetic click),
+  // which could add 50-60+ near-duplicate samples clustered at one screen
+  // location before moving to the next of 13 points. If WebGazer's
+  // regression model only keeps a limited amount of recent training data
+  // in memory (common in this kind of online/incremental setup), that
+  // flood from later points can crowd out and overwrite the earlier
+  // points' data — which looks exactly like "tracking is fine at first,
+  // then drifts away as calibration goes on." Using a single mechanism and
+  // a small, bounded count per point avoids that.
   setTimeout(() => {
     const r = dot.getBoundingClientRect();
     const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    const activeMs = CONFIG.CALIBRATION_DWELL_MS - CONFIG.CALIBRATION_SETTLE_MS;
+    const n = CONFIG.CALIBRATION_SAMPLES_PER_POINT;
+    const stepMs = activeMs / n;
 
-    const recordInterval = setInterval(() => {
-      if (typeof webgazer !== 'undefined' && webgazer.recordScreenPosition) {
-        try { webgazer.recordScreenPosition(cx, cy, 'click'); } catch (e) { /* non-fatal */ }
-      }
-      try {
-        document.dispatchEvent(new MouseEvent('click', {
-          bubbles: true, cancelable: true, clientX: cx, clientY: cy
-        }));
-      } catch (e) { /* non-fatal */ }
-    }, CONFIG.CALIBRATION_RECORD_INTERVAL_MS);
+    for (let k = 0; k < n; k++) {
+      setTimeout(() => {
+        try {
+          document.dispatchEvent(new MouseEvent('click', {
+            bubbles: true, cancelable: true, clientX: cx, clientY: cy
+          }));
+        } catch (e) { /* non-fatal */ }
+      }, k * stepMs);
+    }
 
     setTimeout(() => {
-      clearInterval(recordInterval);
       state.calibIndex++;
       showCalibPoint();
-    }, CONFIG.CALIBRATION_DWELL_MS - CONFIG.CALIBRATION_SETTLE_MS);
+    }, activeMs);
   }, CONFIG.CALIBRATION_SETTLE_MS);
 }
 
