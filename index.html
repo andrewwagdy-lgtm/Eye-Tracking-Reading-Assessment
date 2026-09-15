@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Beyond Correct Answers — Gaze-Based Reading Assessment</title>
+<script src="https://webgazer.cs.brown.edu/webgazer.js" defer></script>
+<style>
+  :root {
+    --navy: #142033;
+    --navy-light: #1f3454;
+    --accent: #e65100;
+    --accent-soft: #ffe0cc;
+    --ink: #1c2430;
+    --muted: #6b7686;
+    --line: #dfe4ea;
+    --bg: #f6f7f9;
+    --ok: #1b7a4d;
+    --bad: #b3261e;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+  }
+  header {
+    background: var(--navy);
+    color: #fff;
+    padding: 18px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  header .sub { font-size: 12px; color: #b7c2d6; }
+  main {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 28px 20px 60px;
+  }
+  .screen { display: none; }
+  .screen.active { display: block; }
+  .card {
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 24px;
+    margin-bottom: 16px;
+  }
+  h2 { margin-top: 0; font-size: 19px; }
+  p { line-height: 1.55; color: #384254; }
+  label { display: block; font-size: 13px; font-weight: 600; margin: 14px 0 5px; }
+  input[type=text] {
+    width: 100%; padding: 9px 10px; border: 1px solid var(--line);
+    border-radius: 6px; font-size: 14px;
+  }
+  .checkline { display: flex; gap: 8px; align-items: flex-start; margin-top: 16px; }
+  .checkline input { margin-top: 3px; }
+  .checkline label { margin: 0; font-weight: 400; font-size: 13px; color: #384254; }
+  button {
+    background: var(--accent); color: #fff; border: none; border-radius: 7px;
+    padding: 11px 20px; font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { background: #c9ccd2; cursor: not-allowed; }
+  button.secondary { background: #fff; color: var(--navy); border: 1px solid var(--line); }
+  .btn-row { display: flex; gap: 10px; margin-top: 18px; }
+  .progress { font-size: 12px; color: var(--muted); margin-bottom: 10px; letter-spacing: .04em; text-transform: uppercase; }
+
+  /* Calibration */
+  #calib-overlay {
+    position: fixed; inset: 0; background: var(--navy); z-index: 50;
+    display: none;
+  }
+  #calib-overlay.active { display: block; }
+  .calib-hint {
+    position: absolute; top: 22px; left: 0; right: 0; text-align: center;
+    color: #fff; font-size: 14px;
+  }
+  .calib-dot {
+    position: absolute; width: 26px; height: 26px; border-radius: 50%;
+    background: var(--accent); border: 3px solid #fff;
+    transform: translate(-50%, -50%); cursor: pointer;
+    box-shadow: 0 0 0 6px rgba(230,81,0,0.25);
+  }
+  .calib-dot.done { background: var(--ok); }
+  #video-preview-wrap {
+    position: fixed; bottom: 14px; right: 14px; z-index: 55;
+    width: 140px; border: 2px solid #fff; border-radius: 8px; overflow: hidden;
+    box-shadow: 0 2px 10px rgba(0,0,0,.35);
+  }
+
+  /* Reading passage */
+  .passage {
+    font-size: 19px; line-height: 2; padding: 18px; border: 1px solid var(--line);
+    border-radius: 8px; background: #fff; max-height: 46vh; overflow: hidden;
+  }
+  .word { padding: 1px 2px; border-radius: 3px; }
+  .options { margin-top: 18px; display: grid; gap: 8px; }
+  .opt-btn {
+    background: #fff; color: var(--ink); border: 1px solid var(--line);
+    text-align: left; padding: 12px 14px; border-radius: 8px; font-weight: 500;
+  }
+  .opt-btn:hover { border-color: var(--accent); }
+
+  /* Result / mockup replica */
+  .result-meta { font-size: 13px; color: var(--muted); margin-bottom: 10px; }
+  .answer-line { font-size: 15px; margin-bottom: 4px; }
+  .answer-line .wrong { color: var(--bad); font-weight: 700; }
+  .answer-line .right { color: var(--ok); font-weight: 700; }
+  .label-pill {
+    display: inline-block; background: var(--accent-soft); color: var(--accent);
+    font-size: 12px; font-weight: 700; padding: 3px 10px; border-radius: 20px;
+    margin-bottom: 10px;
+  }
+  .explanation {
+    background: #fbf3ee; border-left: 3px solid var(--accent); padding: 14px 16px;
+    border-radius: 6px; font-style: italic; color: #3a2c22; margin-top: 12px;
+  }
+  .stat-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 14px;
+    font-size: 12px; color: var(--muted);
+  }
+  .stat-grid b { display: block; font-size: 16px; color: var(--ink); }
+  footer.foot {
+    text-align: center; font-size: 12px; color: var(--muted); padding: 20px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Beyond Correct Answers</h1>
+    <div class="sub">Gaze-based reading process assessment — pilot build</div>
+  </div>
+  <div class="sub" id="session-badge"></div>
+</header>
+
+<main>
+
+  <!-- CONSENT / SETUP -->
+  <section class="screen active" id="screen-consent">
+    <div class="card">
+      <h2>Before we start</h2>
+      <p>This task uses your webcam to estimate where on the screen you're looking while
+         you read. Tracking runs entirely in your browser: <strong>no video is recorded or
+         sent anywhere</strong> — only gaze coordinates and timestamps are saved, and only
+         after you answer each question.</p>
+      <label for="learner-id">Learner ID (or your name/initials)</label>
+      <input type="text" id="learner-id" placeholder="e.g. learner-07" />
+      <div class="checkline">
+        <input type="checkbox" id="consent-check" />
+        <label for="consent-check">I understand my webcam will be used to estimate gaze
+          position for this session, and I agree to take part.</label>
+      </div>
+      <div class="btn-row">
+        <button id="btn-consent-continue" disabled>Continue to calibration</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- CALIBRATION INSTRUCTIONS -->
+  <section class="screen" id="screen-calib-intro">
+    <div class="card">
+      <h2>Calibration (30–60 seconds)</h2>
+      <p>Nine dots will appear one at a time. Look directly at each dot and
+         <strong>click it 5 times</strong> before moving to the next. This teaches the
+         system to map your gaze to screen position for this seat and lighting.</p>
+      <div class="btn-row">
+        <button id="btn-start-calib">Start calibration</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ACCURACY CHECK -->
+  <section class="screen" id="screen-accuracy">
+    <div class="card">
+      <h2>Accuracy check</h2>
+      <p id="accuracy-instructions">Look steadily at the dot in the center of the screen
+         without clicking. This confirms tracking is accurate enough to continue.</p>
+      <div id="accuracy-result" style="display:none;">
+        <p><strong>Estimated error:</strong> <span id="accuracy-px">—</span> px
+           (threshold: <span id="accuracy-threshold"></span> px)</p>
+        <div class="btn-row">
+          <button id="btn-accuracy-continue" class="secondary">Continue anyway</button>
+          <button id="btn-accuracy-recalibrate">Recalibrate</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- READING TASK -->
+  <section class="screen" id="screen-reading">
+    <div class="progress" id="item-progress"></div>
+    <div class="card">
+      <div class="passage" id="passage-el"></div>
+      <div style="margin-top:16px;">
+        <strong id="question-el"></strong>
+      </div>
+      <div class="options" id="options-el"></div>
+    </div>
+  </section>
+
+  <!-- RESULT (heat map + generated explanation, mirrors the talk's mockup) -->
+  <section class="screen" id="screen-result">
+    <div class="card">
+      <div class="label-pill" id="result-label"></div>
+      <p class="answer-line" id="result-question"></p>
+      <p class="answer-line">Learner answer: <span id="result-answer"></span></p>
+      <p class="result-meta" id="result-timing"></p>
+      <div class="passage" id="heatmap-el" style="max-height:none; overflow:visible;"></div>
+      <div class="explanation" id="result-explanation"></div>
+      <div class="stat-grid" id="result-stats"></div>
+      <div class="btn-row">
+        <button id="btn-next-item">Next item</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- DONE -->
+  <section class="screen" id="screen-done">
+    <div class="card">
+      <h2>Session complete</h2>
+      <p>Thanks — your responses and gaze summaries have been submitted. Your webcam has
+         been released.</p>
+      <div class="btn-row">
+        <button id="btn-download" class="secondary">Download this session's data (JSON)</button>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="foot">Illustrative pilot tool, not a validated diagnostic instrument. See the accompanying talk for evidence, caveats, and open questions.</footer>
+
+<div id="calib-overlay">
+  <div class="calib-hint" id="calib-hint">Point 1 of 9 — click 5 times</div>
+</div>
+<div id="video-preview-wrap"></div>
+
+<script>
+/* =========================================================================
+   CONFIG — edit WEBAPP_URL after you deploy code.gs (Deploy > Web app).
+   ========================================================================= */
+const CONFIG = {
+  WEBAPP_URL: 'https://script.google.com/macros/s/AKfycbyuzG9JUz6ghl2ItzCxzFaXSipUqSn01url2qo7lbrJ9zVKoOMet_iQzaAZL6aJEUVG/exec',
+  CALIBRATION_CLICKS_PER_POINT: 5,
+  ACCURACY_THRESHOLD_PX: 200,
+  LOOKBACK_WINDOW_MS: 8000,
+  FIXATION_MIN_DURATION_MS: 150,
+  FIXATION_DISPERSION_PX: 60,
+  WORD_HIT_RADIUS_PX: 70   // max distance from a fixation to still count as "on" a word
+};
+
+const CALIB_POINTS = [
+  [10,10],[50,10],[90,10],
+  [10,50],[50,50],[90,50],
+  [10,90],[50,90],[90,90]
+];
+
+/* =========================================================================
+   STATE
+   ========================================================================= */
+const state = {
+  sessionId: makeId(),
+  learnerId: '',
+  items: [],
+  itemIndex: 0,
+  calibIndex: 0,
+  calibClicks: 0,
+  gazeBuffer: [],       // {x,y,t} t = ms since passage shown, for the CURRENT item
+  passageStartT: 0,
+  wordEls: [],
+  currentItem: null,
+  fullSessionLog: []    // every submitted response, kept client-side for the download button
+};
+
+function makeId() {
+  return (crypto.randomUUID ? crypto.randomUUID() : 'sess-' + Date.now() + '-' + Math.random().toString(16).slice(2));
+}
+
+function showScreen(id) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+
+document.getElementById('session-badge').textContent = 'session ' + state.sessionId.slice(0, 8);
+
+/* =========================================================================
+   JSONP fetch of the item bank (avoids CORS entirely — see code.gs)
+   ========================================================================= */
+function fetchItemBank() {
+  return new Promise((resolve, reject) => {
+    const cbName = '__itemBankCb_' + Date.now();
+    window[cbName] = (payload) => {
+      delete window[cbName];
+      script.remove();
+      if (payload.ok) resolve(payload.items);
+      else reject(new Error(payload.error));
+    };
+    const script = document.createElement('script');
+    script.src = CONFIG.WEBAPP_URL + '?action=getItems&callback=' + cbName;
+    script.onerror = () => reject(new Error('Could not reach the Apps Script web app. Check WEBAPP_URL.'));
+    document.body.appendChild(script);
+  });
+}
+
+function submitResponse(payload) {
+  state.fullSessionLog.push(payload);
+  if (!CONFIG.WEBAPP_URL || CONFIG.WEBAPP_URL.indexOf('PASTE_YOUR') === 0) return;
+  // no-cors: fire-and-forget. Content-Type must stay a CORS-"simple" value
+  // (text/plain) or the browser throws before the request is even sent.
+  fetch(CONFIG.WEBAPP_URL, {
+    method: 'POST',
+    mode: 'no-cors',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify(payload)
+  }).catch(err => console.warn('Submit failed (data is still kept locally):', err));
+}
+
+/* =========================================================================
+   CONSENT SCREEN
+   ========================================================================= */
+const consentCheck = document.getElementById('consent-check');
+const learnerIdInput = document.getElementById('learner-id');
+const continueBtn = document.getElementById('btn-consent-continue');
+consentCheck.addEventListener('change', updateConsentBtn);
+learnerIdInput.addEventListener('input', updateConsentBtn);
+function updateConsentBtn() {
+  continueBtn.disabled = !consentCheck.checked;
+}
+
+continueBtn.addEventListener('click', async () => {
+  state.learnerId = learnerIdInput.value.trim() || ('anon-' + Date.now());
+  continueBtn.disabled = true;
+  continueBtn.textContent = 'Loading items…';
+  try {
+    state.items = await fetchItemBank();
+    if (!state.items.length) throw new Error('Item bank is empty.');
+  } catch (err) {
+    alert('Could not load the item bank.\n\n' + err.message +
+      '\n\nCheck that WEBAPP_URL in index.html points at your deployed Apps Script web app, ' +
+      'and that the sheet has at least one row in ItemBank.');
+    continueBtn.disabled = false;
+    continueBtn.textContent = 'Continue to calibration';
+    return;
+  }
+  try {
+    await initWebgazer();
+  } catch (err) {
+    alert('Could not start the webcam tracker.\n\n' + err.message +
+      '\n\nCheck that you allowed camera access, and that no other tab/app is using the camera.');
+    continueBtn.disabled = false;
+    continueBtn.textContent = 'Continue to calibration';
+    return;
+  }
+  showScreen('screen-calib-intro');
+});
+
+/* =========================================================================
+   WEBGAZER SETUP
+   ========================================================================= */
+async function initWebgazer() {
+  if (typeof webgazer === 'undefined') {
+    alert('WebGazer failed to load — check your internet connection / the CDN URL in index.html.');
+    throw new Error('webgazer not loaded');
+  }
+
+  // Fail fast with a specific, actionable message instead of letting
+  // webgazer's internal MediaPipe loader throw a cryptic "t is not a
+  // function" deep in a promise chain. If this throws, the mediapipe/
+  // folder isn't actually being served at this path yet — see README.
+  await checkMediapipeAssets();
+
+  webgazer
+    .setRegression('ridge')
+    .setTracker('TFFacemesh')   // the only tracker this WebGazer build supports
+    .showVideoPreview(true)
+    .showPredictionPoints(false)
+    .showFaceOverlay(false)
+    .showFaceFeedbackBox(false);
+
+  const beginPromise = webgazer.begin();
+  const timeout = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error('WebGazer did not start within 15s — camera permission denied, or blocked by the browser.')), 15000)
+  );
+  await Promise.race([beginPromise, timeout]);
+
+  const preview = document.querySelector('#webgazerVideoContainer');
+  if (preview) document.getElementById('video-preview-wrap').appendChild(preview);
+}
+
+async function checkMediapipeAssets() {
+  const testUrl = new URL('mediapipe/face_mesh/face_mesh.binarypb', document.baseURI).href;
+  let ok = false;
+  try {
+    const res = await fetch(testUrl, { cache: 'no-store' });
+    ok = res.ok;
+  } catch (e) { /* ok stays false */ }
+  if (!ok) {
+    throw new Error(
+      'Required tracking files are missing at:\n' + testUrl +
+      '\n\nThis means the mediapipe/face_mesh/ folder from the download isn\'t being ' +
+      'served at this URL yet. Check: (1) it was pushed as a sibling of index.html, ' +
+      'not nested inside another folder, (2) a .nojekyll file exists at your repo root ' +
+      '(GitHub Pages\' Jekyll build can silently drop binary files without it), and ' +
+      '(3) you waited for Pages to finish redeploying (Settings → Pages shows the latest ' +
+      'deployment) before hard-refreshing.'
+    );
+  }
+}
+
+/* =========================================================================
+   CALIBRATION
+   ========================================================================= */
+const calibOverlay = document.getElementById('calib-overlay');
+const calibHint = document.getElementById('calib-hint');
+
+document.getElementById('btn-start-calib').addEventListener('click', () => {
+  state.calibIndex = 0;
+  showCalibPoint();
+});
+
+function showCalibPoint() {
+  calibOverlay.classList.add('active');
+  showScreen('screen-calib-intro'); // keep underlying screen consistent while overlay is up
+  document.querySelectorAll('.calib-dot').forEach(d => d.remove());
+
+  if (state.calibIndex >= CALIB_POINTS.length) {
+    calibOverlay.classList.remove('active');
+    startAccuracyCheck();
+    return;
+  }
+
+  const [xPct, yPct] = CALIB_POINTS[state.calibIndex];
+  const dot = document.createElement('div');
+  dot.className = 'calib-dot';
+  dot.style.left = xPct + 'vw';
+  dot.style.top = yPct + 'vh';
+  state.calibClicks = 0;
+  calibHint.textContent = `Point ${state.calibIndex + 1} of ${CALIB_POINTS.length} — click ${CONFIG.CALIBRATION_CLICKS_PER_POINT} times`;
+
+  dot.addEventListener('click', () => {
+    state.calibClicks++;
+    if (state.calibClicks >= CONFIG.CALIBRATION_CLICKS_PER_POINT) {
+      dot.classList.add('done');
+      setTimeout(() => { state.calibIndex++; showCalibPoint(); }, 150);
+    }
+  });
+
+  calibOverlay.appendChild(dot);
+}
+
+/* =========================================================================
+   ACCURACY CHECK
+   ========================================================================= */
+let accuracySamples = [];
+let accuracyListenerActive = false;
+
+function startAccuracyCheck() {
+  showScreen('screen-accuracy');
+  document.getElementById('accuracy-threshold').textContent = CONFIG.ACCURACY_THRESHOLD_PX;
+  document.getElementById('accuracy-result').style.display = 'none';
+  document.getElementById('accuracy-instructions').style.display = 'block';
+
+  const targetX = window.innerWidth / 2;
+  const targetY = window.innerHeight / 2 + 40; // roughly centered under the card heading
+
+  accuracySamples = [];
+  accuracyListenerActive = true;
+  webgazer.setGazeListener((data) => {
+    if (!accuracyListenerActive || !data) return;
+    accuracySamples.push(data);
+  });
+
+  setTimeout(() => {
+    accuracyListenerActive = false;
+    webgazer.setGazeListener(() => {}); // detach
+    const errors = accuracySamples.map(p => Math.hypot(p.x - targetX, p.y - targetY));
+    const meanError = errors.length
+      ? errors.reduce((a, b) => a + b, 0) / errors.length
+      : Infinity;
+
+    document.getElementById('accuracy-px').textContent = isFinite(meanError) ? Math.round(meanError) : 'no data';
+    document.getElementById('accuracy-instructions').style.display = 'none';
+    document.getElementById('accuracy-result').style.display = 'block';
+  }, 2500);
+}
+
+document.getElementById('btn-accuracy-continue').addEventListener('click', startItem);
+document.getElementById('btn-accuracy-recalibrate').addEventListener('click', () => {
+  state.calibIndex = 0;
+  showCalibPoint();
+});
+
+/* =========================================================================
+   READING TASK
+   ========================================================================= */
+function startItem() {
+  if (state.itemIndex >= state.items.length) {
+    endSession();
+    return;
+  }
+  const item = state.items[state.itemIndex];
+  state.currentItem = item;
+  state.gazeBuffer = [];
+
+  document.getElementById('item-progress').textContent =
+    `Item ${state.itemIndex + 1} of ${state.items.length}`;
+
+  const passageEl = document.getElementById('passage-el');
+  passageEl.innerHTML = '';
+  state.wordEls = [];
+  item.passage.split(/\s+/).forEach((w, i) => {
+    const span = document.createElement('span');
+    span.className = 'word';
+    span.textContent = w;
+    span.dataset.idx = i;
+    passageEl.appendChild(span);
+    passageEl.appendChild(document.createTextNode(' '));
+    state.wordEls.push(span);
+  });
+
+  document.getElementById('question-el').textContent = item.question;
+  const optsEl = document.getElementById('options-el');
+  optsEl.innerHTML = '';
+  item.options.forEach(opt => {
+    const btn = document.createElement('button');
+    btn.className = 'opt-btn';
+    btn.textContent = opt;
+    btn.addEventListener('click', () => handleAnswer(opt));
+    optsEl.appendChild(btn);
+  });
+
+  showScreen('screen-reading');
+
+  state.passageStartT = performance.now();
+  webgazer.setGazeListener((data) => {
+    if (!data) return;
+    state.gazeBuffer.push({ x: data.x, y: data.y, t: performance.now() - state.passageStartT });
+  });
+}
+
+/* =========================================================================
+   FIXATION DETECTION (dispersion-threshold algorithm)
+   ========================================================================= */
+function detectFixations(points, minDurationMs, dispersionPx) {
+  const fixations = [];
+  let i = 0;
+  while (i < points.length) {
+    let j = i, minX = points[i].x, maxX = points[i].x, minY = points[i].y, maxY = points[i].y;
+    while (j < points.length) {
+      const p = points[j];
+      const nMinX = Math.min(minX, p.x), nMaxX = Math.max(maxX, p.x);
+      const nMinY = Math.min(minY, p.y), nMaxY = Math.max(maxY, p.y);
+      if ((nMaxX - nMinX) > dispersionPx || (nMaxY - nMinY) > dispersionPx) break;
+      minX = nMinX; maxX = nMaxX; minY = nMinY; maxY = nMaxY;
+      j++;
+    }
+    const duration = points[j - 1].t - points[i].t;
+    if (duration >= minDurationMs) {
+      fixations.push({ x: (minX + maxX) / 2, y: (minY + maxY) / 2, startT: points[i].t, endT: points[j - 1].t, duration });
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  return fixations;
+}
+
+function nearestWordIndex(x, y) {
+  let bestIdx = -1, bestDist = CONFIG.WORD_HIT_RADIUS_PX;
+  state.wordEls.forEach((el, idx) => {
+    const r = el.getBoundingClientRect();
+    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    const d = Math.hypot(x - cx, y - cy);
+    if (d < bestDist) { bestDist = d; bestIdx = idx; }
+  });
+  return bestIdx; // -1 = off-passage
+}
+
+/* =========================================================================
+   ANSWER HANDLING -> gaze analysis -> heuristic explanation -> submit
+   ========================================================================= */
+function handleAnswer(answerGiven) {
+  webgazer.setGazeListener(() => {}); // stop capturing for this item
+  const answerTimeMs = performance.now() - state.passageStartT;
+  const item = state.currentItem;
+
+  const lookbackStart = Math.max(0, answerTimeMs - CONFIG.LOOKBACK_WINDOW_MS);
+  const windowPoints = state.gazeBuffer.filter(p => p.t >= lookbackStart && p.t <= answerTimeMs);
+  const fixations = detectFixations(windowPoints, CONFIG.FIXATION_MIN_DURATION_MS, CONFIG.FIXATION_DISPERSION_PX);
+
+  // Map each fixation to a word (or off-passage), track dwell time per word and regressions.
+  const dwellByWord = {};
+  let offPassageCount = 0;
+  let runningMaxIdx = -1;
+  let regressionCount = 0;
+
+  fixations.forEach(f => {
+    const idx = nearestWordIndex(f.x, f.y);
+    if (idx === -1) { offPassageCount++; return; }
+    dwellByWord[idx] = (dwellByWord[idx] || 0) + f.duration;
+    if (idx < runningMaxIdx) regressionCount++;
+    runningMaxIdx = Math.max(runningMaxIdx, idx);
+  });
+
+  let topIdx = -1, topDwellMs = 0;
+  Object.entries(dwellByWord).forEach(([idx, ms]) => {
+    if (ms > topDwellMs) { topDwellMs = ms; topIdx = Number(idx); }
+  });
+  const topDwellWord = topIdx >= 0 ? state.wordEls[topIdx].textContent : null;
+
+  const avgFixationDurationMs = fixations.length
+    ? fixations.reduce((a, f) => a + f.duration, 0) / fixations.length
+    : 0;
+  const offPassageFraction = fixations.length
+    ? offPassageCount / (fixations.length + offPassageCount)
+    : 1;
+
+  const stats = {
+    fixationCount: fixations.length,
+    avgFixationDurationMs, regressionCount, topDwellWord, topDwellMs, offPassageFraction,
+    lookbackStartMs: Math.round(lookbackStart), lookbackEndMs: Math.round(answerTimeMs)
+  };
+
+  const classification = classifyPattern(stats);
+  const isCorrect = String(answerGiven).trim().toLowerCase() === String(item.correctAnswer).trim().toLowerCase();
+
+  // Full-session (whole item) dwell, for the heat map — separate from the lookback stats above.
+  const allFixations = detectFixations(state.gazeBuffer, CONFIG.FIXATION_MIN_DURATION_MS, CONFIG.FIXATION_DISPERSION_PX);
+  const fullDwellByWord = {};
+  allFixations.forEach(f => {
+    const idx = nearestWordIndex(f.x, f.y);
+    if (idx === -1) return;
+    fullDwellByWord[idx] = (fullDwellByWord[idx] || 0) + f.duration;
+  });
+
+  renderResult(item, answerGiven, isCorrect, answerTimeMs, stats, classification, fullDwellByWord);
+
+  submitResponse({
+    sessionId: state.sessionId,
+    learnerId: state.learnerId,
+    itemId: item.itemId,
+    answerGiven, correctAnswer: item.correctAnswer, isCorrect,
+    answerTimeMs: Math.round(answerTimeMs),
+    classificationLabel: classification.label,
+    generatedExplanation: classification.explanation,
+    gazeSummary: {
+      lookbackStartMs: stats.lookbackStartMs, lookbackEndMs: stats.lookbackEndMs,
+      fixationCount: stats.fixationCount,
+      avgFixationDurationMs: Math.round(stats.avgFixationDurationMs),
+      regressionCount: stats.regressionCount,
+      topDwellWord: stats.topDwellWord || '',
+      topDwellMs: Math.round(stats.topDwellMs)
+    },
+    rawGaze: windowPoints.map(p => [Math.round(p.x), Math.round(p.y), Math.round(p.t)])
+  });
+}
+
+/* Heuristic classifier — illustrative, mirrors the three signatures from the
+   talk (vocabulary slip / syntactic overload / disengagement). This is a
+   transparent rule-of-thumb for a pilot, not a validated diagnostic model —
+   see explainWithLLM_() in code.gs to swap in a real model's judgment instead. */
+function classifyPattern(stats) {
+  const secs = (CONFIG.LOOKBACK_WINDOW_MS / 1000).toFixed(0);
+  if (stats.fixationCount < 3 || stats.offPassageFraction > 0.5) {
+    return {
+      label: 'Disengagement / guess',
+      explanation: `In the ${secs}s before answering, gaze spent little time on the passage ` +
+        `(${Math.round(stats.offPassageFraction * 100)}% of fixations landed off-text) with only ` +
+        `${stats.fixationCount} fixation(s) recorded — consistent with little direct engagement ` +
+        `with the text right before answering.`
+    };
+  }
+  if (stats.regressionCount >= 2) {
+    return {
+      label: 'Syntactic overload',
+      explanation: `In the ${secs}s before answering, ${stats.fixationCount} fixations included ` +
+        `${stats.regressionCount} regressions clustering near "${stats.topDwellWord}" — a pattern ` +
+        `consistent with re-parsing a complex clause rather than a single unfamiliar word.`
+    };
+  }
+  if (stats.topDwellWord && stats.topDwellMs > stats.avgFixationDurationMs * 2 && stats.regressionCount <= 1) {
+    return {
+      label: 'Vocabulary slip',
+      explanation: `In the ${secs}s before answering, gaze concentrated heavily on "${stats.topDwellWord}" ` +
+        `(${Math.round(stats.topDwellMs)}ms dwell, well above the ${Math.round(stats.avgFixationDurationMs)}ms ` +
+        `average fixation) with little backtracking — consistent with a single lexical item driving the answer.`
+    };
+  }
+  return {
+    label: 'Mixed / inconclusive',
+    explanation: `Gaze in the ${secs}s before answering (${stats.fixationCount} fixations, ` +
+      `${stats.regressionCount} regressions) doesn't cleanly match one pattern — worth reviewing ` +
+      `the heat map directly.`
+  };
+}
+
+/* =========================================================================
+   RESULT SCREEN (mirrors the talk's mockup slide)
+   ========================================================================= */
+function renderResult(item, answerGiven, isCorrect, answerTimeMs, stats, classification, fullDwellByWord) {
+  document.getElementById('result-label').textContent = classification.label;
+  document.getElementById('result-question').textContent = 'Q: ' + item.question;
+  const answerEl = document.getElementById('result-answer');
+  answerEl.textContent = answerGiven + (isCorrect ? ' ✓' : ' ✗');
+  answerEl.className = isCorrect ? 'right' : 'wrong';
+  document.getElementById('result-timing').textContent =
+    `Answered at ${(answerTimeMs / 1000).toFixed(1)}s · Look-back window: ` +
+    `${(stats.lookbackStartMs / 1000).toFixed(1)}s–${(stats.lookbackEndMs / 1000).toFixed(1)}s`;
+  document.getElementById('result-explanation').textContent = '"' + classification.explanation + '"';
+
+  // Heat map: recolor a fresh copy of the passage words by full-session dwell time.
+  const heatEl = document.getElementById('heatmap-el');
+  heatEl.innerHTML = '';
+  const maxDwell = Math.max(1, ...Object.values(fullDwellByWord));
+  item.passage.split(/\s+/).forEach((w, i) => {
+    const span = document.createElement('span');
+    span.className = 'word';
+    span.textContent = w;
+    const dwell = fullDwellByWord[i] || 0;
+    if (dwell > 0) {
+      const alpha = 0.12 + 0.68 * (dwell / maxDwell);
+      span.style.background = `rgba(230, 81, 0, ${alpha.toFixed(2)})`;
+    }
+    heatEl.appendChild(span);
+    heatEl.appendChild(document.createTextNode(' '));
+  });
+
+  document.getElementById('result-stats').innerHTML = `
+    <div><b>${stats.fixationCount}</b>fixations in window</div>
+    <div><b>${stats.regressionCount}</b>regressions</div>
+    <div><b>${stats.topDwellWord || '—'}</b>top-dwell word</div>
+  `;
+
+  showScreen('screen-result');
+}
+
+document.getElementById('btn-next-item').addEventListener('click', () => {
+  state.itemIndex++;
+  startItem();
+});
+
+/* =========================================================================
+   SESSION END
+   ========================================================================= */
+function endSession() {
+  webgazer.end();
+  showScreen('screen-done');
+}
+
+document.getElementById('btn-download').addEventListener('click', () => {
+  const blob = new Blob([JSON.stringify(state.fullSessionLog, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `gaze-session-${state.sessionId.slice(0,8)}.json`;
+  a.click();
+});
+</script>
+</body>
+</html>
