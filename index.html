@@ -426,11 +426,16 @@ document.getElementById('btn-start-calib').addEventListener('click', () => {
 
 function showCalibPoint() {
   calibOverlay.classList.add('active');
+  // The webcam preview box sits in the bottom-right corner and can cover a
+  // calibration dot there — hide it for the duration of calibration so
+  // every dot is guaranteed clickable, then restore it afterward.
+  document.getElementById('video-preview-wrap').style.display = 'none';
   showScreen('screen-calib-intro'); // keep underlying screen consistent while overlay is up
   document.querySelectorAll('.calib-dot').forEach(d => d.remove());
 
   if (state.calibIndex >= CALIB_POINTS.length) {
     calibOverlay.classList.remove('active');
+    document.getElementById('video-preview-wrap').style.display = '';
     startAccuracyCheck();
     return;
   }
