@@ -90,7 +90,16 @@
     position: fixed; bottom: 14px; right: 14px; z-index: 55;
     width: 140px; border: 2px solid #fff; border-radius: 8px; overflow: hidden;
     box-shadow: 0 2px 10px rgba(0,0,0,.35);
+    transition: none;
   }
+  /* Used instead of display:none while a calibration/accuracy dot might sit
+     under this box. display:none can cause some browsers to throttle or
+     stop updating a hidden <video> element's frames — which would mean
+     WebGazer trains on a stale/frozen feed for the whole time it's hidden.
+     Moving it off-screen (rather than toggling display) keeps it "visible"
+     to the browser's rendering pipeline, so the camera feed keeps updating
+     normally, while not visually covering anything. */
+  #video-preview-wrap.offscreen { left: -9999px; right: auto; }
 
   /* Reading passage */
   .passage {
@@ -478,15 +487,17 @@ document.getElementById('btn-start-calib').addEventListener('click', () => {
 function showCalibPoint() {
   calibOverlay.classList.add('active');
   // The webcam preview box sits in the bottom-right corner and can cover a
-  // calibration dot there — hide it for the duration of calibration so
-  // every dot is guaranteed visible, then restore it afterward.
-  document.getElementById('video-preview-wrap').style.display = 'none';
+  // calibration dot there — move it off-screen for the duration of
+  // calibration so every dot is guaranteed visible, then restore it
+  // afterward. (Moved off-screen rather than display:none — see the CSS
+  // comment on #video-preview-wrap.offscreen for why.)
+  document.getElementById('video-preview-wrap').classList.add('offscreen');
   showScreen('screen-calib-intro'); // keep underlying screen consistent while overlay is up
   document.querySelectorAll('.calib-dot').forEach(d => d.remove());
 
   if (state.calibIndex >= CALIB_POINTS.length) {
     calibOverlay.classList.remove('active');
-    document.getElementById('video-preview-wrap').style.display = '';
+    document.getElementById('video-preview-wrap').classList.remove('offscreen');
     startAccuracyCheck();
     return;
   }
@@ -562,7 +573,7 @@ function runAccuracyPoint(idx) {
     return;
   }
   calibOverlay.classList.add('active');
-  document.getElementById('video-preview-wrap').style.display = 'none';
+  document.getElementById('video-preview-wrap').classList.add('offscreen');
   document.querySelectorAll('.calib-dot').forEach(d => d.remove());
 
   const [xPct, yPct] = ACCURACY_POINTS[idx];
@@ -593,7 +604,7 @@ function runAccuracyPoint(idx) {
 
 function finishAccuracyCheck() {
   calibOverlay.classList.remove('active');
-  document.getElementById('video-preview-wrap').style.display = '';
+  document.getElementById('video-preview-wrap').classList.remove('offscreen');
 
   const valid = accuracyPointResults.filter(e => e !== null && isFinite(e));
   const meanError = valid.length ? valid.reduce((a, b) => a + b, 0) / valid.length : Infinity;
