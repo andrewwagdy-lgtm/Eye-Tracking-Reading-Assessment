@@ -399,7 +399,14 @@ async function initWebgazer() {
     // stale one. Each session in this app should start from a clean slate.
     .saveDataAcrossSessions(false)
     .showVideoPreview(true)
-    .showPredictionPoints(false)
+    // TEMPORARY DIAGNOSTIC: turned on so you can directly watch WebGazer's
+    // live prediction (a small dot that follows what it thinks you're
+    // looking at) during calibration and reading. If that dot tracks your
+    // eyes reasonably well, the bug is in this app's word-mapping code. If
+    // it's stuck in one spot, jumps around randomly, or sits nowhere near
+    // your actual gaze, the problem is upstream in tracking/calibration
+    // itself. Set back to false once this is sorted out.
+    .showPredictionPoints(true)
     .showFaceOverlay(false)
     .showFaceFeedbackBox(false);
 
