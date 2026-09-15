@@ -179,8 +179,9 @@
   <section class="screen" id="screen-accuracy">
     <div class="card">
       <h2>Accuracy check</h2>
-      <p id="accuracy-instructions">Look steadily at the dot in the center of the screen
-         without clicking. This confirms tracking is accurate enough to continue.</p>
+      <p id="accuracy-instructions">A dot will appear at five spots around the screen, one at a
+         time. Look steadily at each one without clicking — this checks accuracy across the
+         whole screen, not just the center.</p>
       <div id="accuracy-result" style="display:none;">
         <p><strong>Estimated error:</strong> <span id="accuracy-px">—</span> px
            (threshold: <span id="accuracy-threshold"></span> px)</p>
@@ -247,19 +248,30 @@
    ========================================================================= */
 const CONFIG = {
   WEBAPP_URL: 'https://script.google.com/macros/s/AKfycbyuzG9JUz6ghl2ItzCxzFaXSipUqSn01url2qo7lbrJ9zVKoOMet_iQzaAZL6aJEUVG/exec',
-  CALIBRATION_CLICKS_PER_POINT: 5,
+  CALIBRATION_CLICKS_PER_POINT: 8,
   ACCURACY_THRESHOLD_PX: 200,
+  ACCURACY_SETTLE_MS: 400,     // discard samples in this window after a target appears — eyes are still saccading toward it
+  ACCURACY_SAMPLE_MS: 1200,    // then sample for this long
   LOOKBACK_WINDOW_MS: 8000,
   FIXATION_MIN_DURATION_MS: 150,
   FIXATION_DISPERSION_PX: 60,
   WORD_HIT_RADIUS_PX: 70   // max distance from a fixation to still count as "on" a word
 };
 
+// 13-point grid: the original 3x3 plus four inner quadrant points, for
+// denser coverage of the middle of the screen (where reading actually
+// happens) rather than just the edges.
 const CALIB_POINTS = [
   [10,10],[50,10],[90,10],
   [10,50],[50,50],[90,50],
-  [10,90],[50,90],[90,90]
+  [10,90],[50,90],[90,90],
+  [30,30],[70,30],[30,70],[70,70]
 ];
+
+// Accuracy is checked at multiple locations, not just the center — a model
+// that looks accurate in the middle of the screen can still be noticeably
+// worse near the edges. The reported error is the average across all of these.
+const ACCURACY_POINTS = [[50,50],[25,25],[75,25],[25,75],[75,75]];
 
 /* =========================================================================
    STATE
@@ -450,6 +462,14 @@ function showCalibPoint() {
 
   dot.addEventListener('click', () => {
     state.calibClicks++;
+    // Feed WebGazer the dot's exact geometric center, not just the raw click
+    // pixel (which can be a few px off if the click lands slightly away from
+    // center) — this is the ground-truth target the person was looking at.
+    if (typeof webgazer !== 'undefined' && webgazer.recordScreenPosition) {
+      const r = dot.getBoundingClientRect();
+      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      try { webgazer.recordScreenPosition(cx, cy, 'click'); } catch (e) { /* non-fatal */ }
+    }
     if (state.calibClicks >= CONFIG.CALIBRATION_CLICKS_PER_POINT) {
       dot.classList.add('done');
       setTimeout(() => { state.calibIndex++; showCalibPoint(); }, 150);
@@ -460,39 +480,66 @@ function showCalibPoint() {
 }
 
 /* =========================================================================
-   ACCURACY CHECK
+   ACCURACY CHECK — now checks 5 locations (not just center) and discards
+   an initial "settle" window at each so early saccade noise doesn't
+   inflate the error estimate.
    ========================================================================= */
-let accuracySamples = [];
-let accuracyListenerActive = false;
+let accuracyPointResults = [];
 
 function startAccuracyCheck() {
   showScreen('screen-accuracy');
   document.getElementById('accuracy-threshold').textContent = CONFIG.ACCURACY_THRESHOLD_PX;
   document.getElementById('accuracy-result').style.display = 'none';
   document.getElementById('accuracy-instructions').style.display = 'block';
+  accuracyPointResults = [];
+  runAccuracyPoint(0);
+}
 
-  const targetX = window.innerWidth / 2;
-  const targetY = window.innerHeight / 2 + 40; // roughly centered under the card heading
+function runAccuracyPoint(idx) {
+  if (idx >= ACCURACY_POINTS.length) {
+    finishAccuracyCheck();
+    return;
+  }
+  calibOverlay.classList.add('active');
+  document.getElementById('video-preview-wrap').style.display = 'none';
+  document.querySelectorAll('.calib-dot').forEach(d => d.remove());
 
-  accuracySamples = [];
-  accuracyListenerActive = true;
-  webgazer.setGazeListener((data) => {
-    if (!accuracyListenerActive || !data) return;
-    accuracySamples.push(data);
-  });
+  const [xPct, yPct] = ACCURACY_POINTS[idx];
+  const dot = document.createElement('div');
+  dot.className = 'calib-dot';
+  dot.style.left = xPct + 'vw';
+  dot.style.top = yPct + 'vh';
+  dot.style.cursor = 'default';
+  calibHint.textContent = `Accuracy check ${idx + 1} of ${ACCURACY_POINTS.length} — just look, don't click`;
+  calibOverlay.appendChild(dot);
 
+  // Discard the settle window (eyes still moving toward the dot), then sample.
   setTimeout(() => {
-    accuracyListenerActive = false;
-    webgazer.setGazeListener(() => {}); // detach
-    const errors = accuracySamples.map(p => Math.hypot(p.x - targetX, p.y - targetY));
-    const meanError = errors.length
-      ? errors.reduce((a, b) => a + b, 0) / errors.length
-      : Infinity;
+    const r = dot.getBoundingClientRect();
+    const targetX = r.left + r.width / 2, targetY = r.top + r.height / 2;
+    const samples = [];
+    webgazer.setGazeListener((data) => { if (data) samples.push(data); });
 
-    document.getElementById('accuracy-px').textContent = isFinite(meanError) ? Math.round(meanError) : 'no data';
-    document.getElementById('accuracy-instructions').style.display = 'none';
-    document.getElementById('accuracy-result').style.display = 'block';
-  }, 2500);
+    setTimeout(() => {
+      webgazer.setGazeListener(() => {}); // detach
+      const errors = samples.map(p => Math.hypot(p.x - targetX, p.y - targetY));
+      const meanError = errors.length ? errors.reduce((a, b) => a + b, 0) / errors.length : null;
+      accuracyPointResults.push(meanError);
+      runAccuracyPoint(idx + 1);
+    }, CONFIG.ACCURACY_SAMPLE_MS);
+  }, CONFIG.ACCURACY_SETTLE_MS);
+}
+
+function finishAccuracyCheck() {
+  calibOverlay.classList.remove('active');
+  document.getElementById('video-preview-wrap').style.display = '';
+
+  const valid = accuracyPointResults.filter(e => e !== null && isFinite(e));
+  const meanError = valid.length ? valid.reduce((a, b) => a + b, 0) / valid.length : Infinity;
+
+  document.getElementById('accuracy-px').textContent = isFinite(meanError) ? Math.round(meanError) : 'no data';
+  document.getElementById('accuracy-instructions').style.display = 'none';
+  document.getElementById('accuracy-result').style.display = 'block';
 }
 
 document.getElementById('btn-accuracy-continue').addEventListener('click', startItem);
