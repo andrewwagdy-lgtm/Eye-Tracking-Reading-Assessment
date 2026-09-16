@@ -4,7 +4,6 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Beyond Correct Answers — Gaze-Based Reading Assessment</title>
-<script src="https://webgazer.cs.brown.edu/webgazer.js" defer></script>
 <style>
   :root {
     --navy: #142033;
@@ -92,14 +91,26 @@
     box-shadow: 0 2px 10px rgba(0,0,0,.35);
     transition: none;
   }
+  #video-preview-wrap video { display: block; width: 100%; transform: scaleX(-1); }
   /* Used instead of display:none while a calibration/accuracy dot might sit
      under this box. display:none can cause some browsers to throttle or
      stop updating a hidden <video> element's frames — which would mean
-     WebGazer trains on a stale/frozen feed for the whole time it's hidden.
-     Moving it off-screen (rather than toggling display) keeps it "visible"
-     to the browser's rendering pipeline, so the camera feed keeps updating
-     normally, while not visually covering anything. */
+     the tracker trains on a stale/frozen feed for the whole time it's
+     hidden. Moving it off-screen (rather than toggling display) keeps it
+     "visible" to the browser's rendering pipeline, so the camera feed
+     keeps updating normally, while not visually covering anything. */
   #video-preview-wrap.offscreen { left: -9999px; right: auto; }
+
+  /* Live gaze prediction indicator — our own equivalent of WebGazer's
+     showPredictionPoints diagnostic dot. Left on by default so tracking
+     quality is always directly observable; see index.html CONFIG. */
+  #live-gaze-dot {
+    position: fixed; width: 16px; height: 16px; border-radius: 50%;
+    background: rgba(0, 200, 255, 0.55); border: 2px solid rgba(0,140,190,0.9);
+    transform: translate(-50%, -50%); pointer-events: none; z-index: 60;
+    display: none;
+  }
+  #live-gaze-dot.active { display: block; }
 
   /* Reading passage */
   .passage {
@@ -248,19 +259,33 @@
 <footer class="foot">Illustrative pilot tool, not a validated diagnostic instrument. See the accompanying talk for evidence, caveats, and open questions.</footer>
 
 <div id="calib-overlay">
-  <div class="calib-hint" id="calib-hint">Point 1 of 9 — click 5 times</div>
+  <div class="calib-hint" id="calib-hint">Point 1 of 13 — just look at the dot</div>
 </div>
 <div id="video-preview-wrap"></div>
+<div id="live-gaze-dot"></div>
 
-<script>
+<script type="module">
+import { FaceLandmarker, FilesetResolver } from './mediapipe-vision-wasm/vision_bundle.mjs';
+
 /* =========================================================================
    CONFIG — edit WEBAPP_URL after you deploy code.gs (Deploy > Web app).
    ========================================================================= */
 const CONFIG = {
   WEBAPP_URL: 'https://script.google.com/macros/s/AKfycbyuzG9JUz6ghl2ItzCxzFaXSipUqSn01url2qo7lbrJ9zVKoOMet_iQzaAZL6aJEUVG/exec',
+
+  // Tracking backend: MediaPipe Face Landmarker (Google-maintained, Apache-2.0)
+  // instead of WebGazer. The WASM runtime is self-hosted (see mediapipe-vision-wasm/,
+  // resolved relative to this page — same reasoning as the old mediapipe/face_mesh/
+  // folder). The .task model file is fetched directly from Google's public,
+  // CORS-enabled hosting at runtime — this one genuinely is meant to be
+  // loaded that way (it's how every official MediaPipe web sample does it),
+  // unlike a relative path, so there's nothing to self-host here.
+  MODEL_ASSET_URL: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+  WASM_BASE_PATH: 'mediapipe-vision-wasm',
+
   CALIBRATION_DWELL_MS: 5000,        // how long each calibration dot stays on screen
   CALIBRATION_SETTLE_MS: 500,        // discard this much time after a dot appears — eyes are still moving toward it
-  CALIBRATION_SAMPLES_PER_POINT: 8,  // fixed, small count per point — NOT a continuous stream (see showCalibPoint)
+  CALIBRATION_SAMPLE_INTERVAL_MS: 120, // how often to add a training sample during dwell — safe to sample densely now, see README
   ACCURACY_THRESHOLD_PX: 200,
   ACCURACY_SETTLE_MS: 400,     // discard samples in this window after a target appears — eyes are still saccading toward it
   ACCURACY_SAMPLE_MS: 1200,    // then sample for this long
@@ -268,6 +293,7 @@ const CONFIG = {
   GAZE_SMOOTHING_ALPHA: 0.25,  // exponential smoothing on the raw gaze stream — lower = smoother but more lag, higher = more responsive but jittery. 1 = no smoothing.
   FIXATION_MIN_DURATION_MS: 150,
   FIXATION_DISPERSION_PX: 70,  // how much scatter is still considered "one fixation" — loosened to tolerate residual jitter after smoothing
+  RIDGE_LAMBDA: 1.0,           // regularization strength for the calibration regression — higher = more resistant to overfitting a noisy calibration
 
   // Individual words often sit closer together than a webcam eye tracker's
   // real accuracy — no amount of smoothing changes that. So the heat map
@@ -293,6 +319,221 @@ const CALIB_POINTS = [
 // that looks accurate in the middle of the screen can still be noticeably
 // worse near the edges. The reported error is the average across all of these.
 const ACCURACY_POINTS = [[50,50],[25,25],[75,25],[25,75],[75,75]];
+
+/* =========================================================================
+   TRACKING BACKEND — MediaPipe Face Landmarker + our own calibration
+   ========================================================================= *
+   Replaces WebGazer entirely. We extract normalized iris position within
+   each eye socket (a standard, well-documented gaze-estimation feature —
+   see e.g. RealEye's open-source webcam-eyetracker-light-open, which uses
+   the same underlying approach) plus a head-position proxy from the nose
+   tip, and fit our own small ridge regression from those features to
+   screen coordinates using this session's calibration samples. Everything
+   downstream (fixation detection, clustering, heat map, classification,
+   Sheet submission) is UNCHANGED from the WebGazer version — it just
+   consumes an (x, y, t) stream, same as before.
+
+   KNOWN SIMPLIFICATION: this uses eye-socket-relative iris position and a
+   raw head-position proxy (not a full 6-DOF head-pose decomposition from
+   MediaPipe's facial transformation matrix). This is a genuine improvement
+   over WebGazer for translational head movement, but not a complete fix
+   for head rotation — see the README for where a fuller head-pose
+   correction would plug in if you want to extend this further.
+   ========================================================================= */
+
+// Standard MediaPipe Face Landmarker topology indices (confirmed directly
+// from FaceLandmarker.FACE_LANDMARKS_LEFT_EYE / _RIGHT_EYE / _LEFT_IRIS /
+// _RIGHT_IRIS in the library itself, not just convention).
+const EYE_LANDMARKS = {
+  right: { irisCenter: 468, cornerA: 33,  cornerB: 133, lidTop: 159, lidBottom: 145 },
+  left:  { irisCenter: 473, cornerA: 362, cornerB: 263, lidTop: 386, lidBottom: 374 }
+};
+const NOSE_TIP_INDEX = 1;
+
+let faceLandmarker = null;
+let trackingVideoEl = null;
+let trackingStream = null;
+let trackingRAF = null;
+let calibModel = null; // { betaX: [...], betaY: [...] } once fit, else null
+let liveGazeListener = () => {}; // current consumer of per-frame predictions
+let lastFeatures = null;         // most recent frame's feature vector, read by addCalibrationSample()
+const calibrationSamples = []; // { features: number[], x: number, y: number }[]
+
+function extractFeatures(landmarks) {
+  const L = (i) => landmarks[i];
+  function eyeFeature(cfg) {
+    const iris = L(cfg.irisCenter), a = L(cfg.cornerA), b = L(cfg.cornerB),
+          top = L(cfg.lidTop), bot = L(cfg.lidBottom);
+    const width = (b.x - a.x) || 1e-6, height = (bot.y - top.y) || 1e-6;
+    return [(iris.x - a.x) / width, (iris.y - top.y) / height];
+  }
+  const right = eyeFeature(EYE_LANDMARKS.right);
+  const left = eyeFeature(EYE_LANDMARKS.left);
+  const nose = L(NOSE_TIP_INDEX);
+  return [...right, ...left, nose.x, nose.y, nose.z];
+}
+
+/* ---- tiny matrix helpers, just enough for closed-form ridge regression ---- */
+function matTranspose(A) {
+  return A[0].map((_, j) => A.map(row => row[j]));
+}
+function matMultiply(A, B) {
+  const r = A.length, k = B.length, c = B[0].length;
+  const out = Array.from({ length: r }, () => new Array(c).fill(0));
+  for (let i = 0; i < r; i++)
+    for (let kk = 0; kk < k; kk++) {
+      const a = A[i][kk];
+      if (a === 0) continue;
+      for (let j = 0; j < c; j++) out[i][j] += a * B[kk][j];
+    }
+  return out;
+}
+function matVecMultiply(A, v) {
+  return A.map(row => row.reduce((s, a, i) => s + a * v[i], 0));
+}
+// Solves (A + lambda*I) x = b via Gauss-Jordan elimination. A is square.
+function solveRidgeSystem(A, b, lambda) {
+  const n = A.length;
+  const M = A.map((row, i) => [...row.map((v, j) => v + (i === j ? lambda : 0)), b[i]]);
+  for (let col = 0; col < n; col++) {
+    let pivot = col;
+    for (let r = col + 1; r < n; r++) if (Math.abs(M[r][col]) > Math.abs(M[pivot][col])) pivot = r;
+    [M[col], M[pivot]] = [M[pivot], M[col]];
+    const pv = M[col][col] || 1e-9;
+    for (let j = col; j <= n; j++) M[col][j] /= pv;
+    for (let r = 0; r < n; r++) {
+      if (r === col) continue;
+      const f = M[r][col];
+      if (f === 0) continue;
+      for (let j = col; j <= n; j++) M[r][j] -= f * M[col][j];
+    }
+  }
+  return M.map(row => row[n]);
+}
+function fitRidge(X, y, lambda) {
+  const Xt = matTranspose(X);
+  const XtX = matMultiply(Xt, X);
+  const Xty = matVecMultiply(Xt, y);
+  return solveRidgeSystem(XtX, Xty, lambda);
+}
+
+function fitCalibrationModel() {
+  if (calibrationSamples.length < 15) {
+    throw new Error('Not enough calibration data was collected (' + calibrationSamples.length + ' samples).');
+  }
+  const X = calibrationSamples.map(s => [1, ...s.features]); // bias term + features
+  const yX = calibrationSamples.map(s => s.x);
+  const yY = calibrationSamples.map(s => s.y);
+  calibModel = {
+    betaX: fitRidge(X, yX, CONFIG.RIDGE_LAMBDA),
+    betaY: fitRidge(X, yY, CONFIG.RIDGE_LAMBDA)
+  };
+}
+
+function predictFromFeatures(features) {
+  if (!calibModel) return null;
+  const row = [1, ...features];
+  const dot = (beta) => row.reduce((s, v, i) => s + v * beta[i], 0);
+  return { x: dot(calibModel.betaX), y: dot(calibModel.betaY) };
+}
+
+async function initTracking() {
+  await checkTrackingAssets();
+
+  const vision = await FilesetResolver.forVisionTasks(CONFIG.WASM_BASE_PATH);
+  faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+    baseOptions: { modelAssetPath: CONFIG.MODEL_ASSET_URL, delegate: 'GPU' },
+    runningMode: 'VIDEO',
+    numFaces: 1,
+    outputFaceBlendshapes: false,
+    outputFacialTransformationMatrixes: false
+  });
+
+  trackingStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+  trackingVideoEl = document.createElement('video');
+  trackingVideoEl.autoplay = true;
+  trackingVideoEl.muted = true;
+  trackingVideoEl.playsInline = true;
+  trackingVideoEl.srcObject = trackingStream;
+  document.getElementById('video-preview-wrap').appendChild(trackingVideoEl);
+
+  await new Promise((resolve, reject) => {
+    trackingVideoEl.addEventListener('loadeddata', resolve, { once: true });
+    setTimeout(() => reject(new Error('Camera feed did not start within 15s — camera permission denied, or blocked by the browser.')), 15000);
+  });
+
+  let smoothX = null, smoothY = null;
+  const liveDot = document.getElementById('live-gaze-dot');
+
+  function frame() {
+    trackingRAF = requestAnimationFrame(frame);
+    if (!trackingVideoEl || trackingVideoEl.readyState < 2) return;
+
+    const result = faceLandmarker.detectForVideo(trackingVideoEl, performance.now());
+    if (!result.faceLandmarks || !result.faceLandmarks.length) {
+      liveDot.classList.remove('active');
+      liveGazeListener(null);
+      return;
+    }
+
+    const features = extractFeatures(result.faceLandmarks[0]);
+    const raw = predictFromFeatures(features);
+
+    // During calibration itself (before a model is fit), there's no
+    // prediction to smooth/emit yet — addCalibrationSample() reads
+    // `features` directly instead, via lastFeatures below.
+    lastFeatures = features;
+
+    if (!raw) { liveDot.classList.remove('active'); liveGazeListener(null); return; }
+
+    if (smoothX === null) { smoothX = raw.x; smoothY = raw.y; }
+    else {
+      const a = CONFIG.GAZE_SMOOTHING_ALPHA;
+      smoothX = a * raw.x + (1 - a) * smoothX;
+      smoothY = a * raw.y + (1 - a) * smoothY;
+    }
+
+    liveDot.classList.add('active');
+    liveDot.style.left = smoothX + 'px';
+    liveDot.style.top = smoothY + 'px';
+    liveGazeListener({ x: smoothX, y: smoothY });
+  }
+  trackingRAF = requestAnimationFrame(frame);
+}
+
+function setGazeListener(cb) { liveGazeListener = cb || (() => {}); }
+
+function addCalibrationSample(targetX, targetY) {
+  if (!lastFeatures) return;
+  calibrationSamples.push({ features: lastFeatures, x: targetX, y: targetY });
+}
+
+function stopTracking() {
+  if (trackingRAF) cancelAnimationFrame(trackingRAF);
+  trackingRAF = null;
+  if (trackingStream) trackingStream.getTracks().forEach(t => t.stop());
+  trackingStream = null;
+  document.getElementById('live-gaze-dot').classList.remove('active');
+}
+
+async function checkTrackingAssets() {
+  const testUrl = new URL(CONFIG.WASM_BASE_PATH + '/vision_wasm_internal.js', document.baseURI).href;
+  let ok = false;
+  try {
+    const res = await fetch(testUrl, { cache: 'no-store' });
+    ok = res.ok;
+  } catch (e) { /* ok stays false */ }
+  if (!ok) {
+    throw new Error(
+      'Required tracking files are missing at:\n' + testUrl +
+      '\n\nThis means the mediapipe-vision-wasm/ folder from the download isn\'t being ' +
+      'served at this URL yet. Check: (1) it was pushed as a sibling of index.html, ' +
+      'not nested inside another folder, (2) a .nojekyll file exists at your repo root ' +
+      '(GitHub Pages\' Jekyll build can silently drop binary files without it), and ' +
+      '(3) you waited for Pages to finish redeploying before hard-refreshing.'
+    );
+  }
+}
 
 /* =========================================================================
    STATE
@@ -382,7 +623,7 @@ continueBtn.addEventListener('click', async () => {
     return;
   }
   try {
-    await initWebgazer();
+    await initTracking();
   } catch (err) {
     alert('Could not start the webcam tracker.\n\n' + err.message +
       '\n\nCheck that you allowed camera access, and that no other tab/app is using the camera.');
@@ -392,86 +633,6 @@ continueBtn.addEventListener('click', async () => {
   }
   showScreen('screen-calib-intro');
 });
-
-/* =========================================================================
-   WEBGAZER SETUP
-   ========================================================================= */
-async function initWebgazer() {
-  if (typeof webgazer === 'undefined') {
-    alert('WebGazer failed to load — check your internet connection / the CDN URL in index.html.');
-    throw new Error('webgazer not loaded');
-  }
-
-  // Fail fast with a specific, actionable message instead of letting
-  // webgazer's internal MediaPipe loader throw a cryptic "t is not a
-  // function" deep in a promise chain. If this throws, the mediapipe/
-  // folder isn't actually being served at this path yet — see README.
-  await checkMediapipeAssets();
-
-  webgazer
-    .setRegression('ridge')
-    .setTracker('TFFacemesh')   // the only tracker this WebGazer build supports
-    // Smooths frame-to-frame prediction jitter (the raw signal is naturally
-    // noisy — every video frame's eye-feature estimate wobbles slightly even
-    // when your gaze is genuinely steady). This affects the actual gaze data
-    // used for fixation detection, not just the visible dot's smoothness.
-    .applyKalmanFilter(true)
-    // Never blend in training data saved by a PREVIOUS browser session. Without
-    // this, webgazer.begin() auto-loads whatever calibration data localStorage
-    // has left over (different seating, lighting, even a different day) and
-    // merges it with this session's — diluting a good calibration with a
-    // stale one. Each session in this app should start from a clean slate.
-    .saveDataAcrossSessions(false)
-    .showVideoPreview(true)
-    // TEMPORARY DIAGNOSTIC: turned on so you can directly watch WebGazer's
-    // live prediction (a small dot that follows what it thinks you're
-    // looking at) during calibration and reading. If that dot tracks your
-    // eyes reasonably well, the bug is in this app's word-mapping code. If
-    // it's stuck in one spot, jumps around randomly, or sits nowhere near
-    // your actual gaze, the problem is upstream in tracking/calibration
-    // itself. Set back to false once this is sorted out.
-    .showPredictionPoints(true)
-    .showFaceOverlay(false)
-    .showFaceFeedbackBox(false);
-
-  const beginPromise = webgazer.begin();
-  const timeout = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error('WebGazer did not start within 15s — camera permission denied, or blocked by the browser.')), 15000)
-  );
-  await Promise.race([beginPromise, timeout]);
-
-  // Belt-and-suspenders: wipe anything already sitting in localStorage from
-  // an earlier session (e.g. from testing before this fix existed).
-  try { webgazer.clearData(); } catch (e) { /* non-fatal */ }
-
-  // NOTE: WebGazer's native click-listener is deliberately left ON here —
-  // it's the verified-working training mechanism, and calibration below
-  // relies on it (via synthetic dispatched clicks). It gets turned off
-  // once calibration is actually done — see freezeCalibration() below.
-
-  const preview = document.querySelector('#webgazerVideoContainer');
-  if (preview) document.getElementById('video-preview-wrap').appendChild(preview);
-}
-
-async function checkMediapipeAssets() {
-  const testUrl = new URL('mediapipe/face_mesh/face_mesh.binarypb', document.baseURI).href;
-  let ok = false;
-  try {
-    const res = await fetch(testUrl, { cache: 'no-store' });
-    ok = res.ok;
-  } catch (e) { /* ok stays false */ }
-  if (!ok) {
-    throw new Error(
-      'Required tracking files are missing at:\n' + testUrl +
-      '\n\nThis means the mediapipe/face_mesh/ folder from the download isn\'t being ' +
-      'served at this URL yet. Check: (1) it was pushed as a sibling of index.html, ' +
-      'not nested inside another folder, (2) a .nojekyll file exists at your repo root ' +
-      '(GitHub Pages\' Jekyll build can silently drop binary files without it), and ' +
-      '(3) you waited for Pages to finish redeploying (Settings → Pages shows the latest ' +
-      'deployment) before hard-refreshing.'
-    );
-  }
-}
 
 /* =========================================================================
    CALIBRATION
@@ -498,6 +659,14 @@ function showCalibPoint() {
   if (state.calibIndex >= CALIB_POINTS.length) {
     calibOverlay.classList.remove('active');
     document.getElementById('video-preview-wrap').classList.remove('offscreen');
+    try {
+      fitCalibrationModel();
+    } catch (err) {
+      alert('Calibration failed: ' + err.message + '\n\nPlease try again — make sure your face is clearly visible to the camera throughout.');
+      state.calibIndex = 0;
+      showCalibPoint();
+      return;
+    }
     startAccuracyCheck();
     return;
   }
@@ -511,40 +680,25 @@ function showCalibPoint() {
   calibHint.textContent = `Point ${state.calibIndex + 1} of ${CALIB_POINTS.length} — just look at the dot`;
   calibOverlay.appendChild(dot);
 
-  // No physical click required from you: discard the settle window (eyes
-  // still moving toward the dot), then dispatch a FIXED, SMALL number of
-  // synthetic clicks at the dot's exact center, spaced evenly across the
-  // rest of the dwell time — deliberately mirroring the density of the
-  // original manual "click 8 times" design, not a continuous stream.
-  //
-  // Earlier versions of this file fired training samples every 150ms via
-  // TWO mechanisms at once (recordScreenPosition + a synthetic click),
-  // which could add 50-60+ near-duplicate samples clustered at one screen
-  // location before moving to the next of 13 points. If WebGazer's
-  // regression model only keeps a limited amount of recent training data
-  // in memory (common in this kind of online/incremental setup), that
-  // flood from later points can crowd out and overwrite the earlier
-  // points' data — which looks exactly like "tracking is fine at first,
-  // then drifts away as calibration goes on." Using a single mechanism and
-  // a small, bounded count per point avoids that.
+  // No physical click required: discard the settle window (eyes still
+  // moving toward the dot), then add a training sample at a steady interval
+  // for the rest of the dwell time, using the dot's exact center as ground
+  // truth. Unlike the old WebGazer version, there's no risk of "flooding"
+  // here — every sample from every point is collected into one array and
+  // used together in a single least-squares fit at the very end (see
+  // fitCalibrationModel), not fed into some opaque incremental model that
+  // could let later points crowd out earlier ones. More samples only helps.
   setTimeout(() => {
     const r = dot.getBoundingClientRect();
     const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
     const activeMs = CONFIG.CALIBRATION_DWELL_MS - CONFIG.CALIBRATION_SETTLE_MS;
-    const n = CONFIG.CALIBRATION_SAMPLES_PER_POINT;
-    const stepMs = activeMs / n;
 
-    for (let k = 0; k < n; k++) {
-      setTimeout(() => {
-        try {
-          document.dispatchEvent(new MouseEvent('click', {
-            bubbles: true, cancelable: true, clientX: cx, clientY: cy
-          }));
-        } catch (e) { /* non-fatal */ }
-      }, k * stepMs);
-    }
+    const sampleInterval = setInterval(() => {
+      addCalibrationSample(cx, cy);
+    }, CONFIG.CALIBRATION_SAMPLE_INTERVAL_MS);
 
     setTimeout(() => {
+      clearInterval(sampleInterval);
       state.calibIndex++;
       showCalibPoint();
     }, activeMs);
@@ -590,10 +744,10 @@ function runAccuracyPoint(idx) {
     const r = dot.getBoundingClientRect();
     const targetX = r.left + r.width / 2, targetY = r.top + r.height / 2;
     const samples = [];
-    webgazer.setGazeListener((data) => { if (data) samples.push(data); });
+    setGazeListener((data) => { if (data) samples.push(data); });
 
     setTimeout(() => {
-      webgazer.setGazeListener(() => {}); // detach
+      setGazeListener(() => {}); // detach
       const errors = samples.map(p => Math.hypot(p.x - targetX, p.y - targetY));
       const meanError = errors.length ? errors.reduce((a, b) => a + b, 0) / errors.length : null;
       accuracyPointResults.push(meanError);
@@ -619,23 +773,17 @@ function finishAccuracyCheck() {
 }
 
 document.getElementById('btn-accuracy-continue').addEventListener('click', () => {
-  freezeCalibration();
   startItem();
 });
 document.getElementById('btn-accuracy-recalibrate').addEventListener('click', () => {
+  // Discard any samples/model from the previous attempt — otherwise a
+  // recalibration would blend old (possibly bad) data with the new pass,
+  // the same class of bug fixed earlier for cross-session persistence.
+  calibrationSamples.length = 0;
+  calibModel = null;
   state.calibIndex = 0;
   showCalibPoint();
 });
-
-// Calibration is genuinely finished — stop WebGazer's built-in habit of
-// continuing to "learn" from every click and mouse movement from here on.
-// It stayed on through calibration deliberately (see showCalibPoint()); if
-// it stayed on during the reading task too, moving your mouse toward an
-// answer button while still reading would keep feeding that mismatch back
-// into the model, drifting it away from the calibration you just did.
-function freezeCalibration() {
-  try { webgazer.removeMouseEventListeners(); } catch (e) { /* non-fatal */ }
-}
 
 /* =========================================================================
    READING TASK
@@ -681,13 +829,13 @@ function startItem() {
   state.passageStartT = performance.now();
 
   // Exponential smoothing on the raw gaze stream: each new point is pulled
-  // partway toward WebGazer's raw prediction rather than replacing the
-  // previous point outright. This is a second, more aggressive smoothing
-  // pass on top of WebGazer's own Kalman filter, and — unlike that one —
-  // it's ours to tune (GAZE_SMOOTHING_ALPHA in CONFIG). Only the SMOOTHED
-  // point is stored, so fixation detection and word-mapping both benefit.
+  // partway toward the raw prediction rather than replacing the previous
+  // point outright. This is our only smoothing layer (there's no separate
+  // vendor-side filter underneath anymore) and it's fully ours to tune —
+  // GAZE_SMOOTHING_ALPHA in CONFIG. Only the SMOOTHED point is stored, so
+  // fixation detection and word-mapping both benefit.
   let smoothX = null, smoothY = null;
-  webgazer.setGazeListener((data) => {
+  setGazeListener((data) => {
     if (!data) return;
     if (smoothX === null) {
       smoothX = data.x; smoothY = data.y;
@@ -789,7 +937,7 @@ function currentMinClusterWidthPx() {
    ANSWER HANDLING -> gaze analysis -> heuristic explanation -> submit
    ========================================================================= */
 function handleAnswer(answerGiven) {
-  webgazer.setGazeListener(() => {}); // stop capturing for this item
+  setGazeListener(() => {}); // stop capturing for this item
   const answerTimeMs = performance.now() - state.passageStartT;
   const item = state.currentItem;
 
@@ -969,11 +1117,10 @@ document.getElementById('btn-next-item').addEventListener('click', () => {
    SESSION END
    ========================================================================= */
 function endSession() {
-  webgazer.end();
-  // webgazer.end() auto-saves this session's training data to localStorage.
-  // Wipe it immediately so it can never bleed into a future session, even
-  // though saveDataAcrossSessions(false) should already stop it being loaded.
-  try { webgazer.clearData(); } catch (e) { /* non-fatal */ }
+  // Stop the detection loop and release the camera — everything lives only
+  // in this page's memory (calibrationSamples, calibModel), so there's
+  // nothing persisted to clean up the way WebGazer's localStorage was.
+  stopTracking();
   showScreen('screen-done');
 }
 
