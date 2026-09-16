@@ -119,6 +119,11 @@
     max-height: 55vh; overflow: hidden;
   }
   .word { padding: 6px 4px; border-radius: 3px; }
+
+  #mouse-calib-box {
+    border: 1px solid var(--line); border-radius: 8px; background: #fff;
+    margin-top: 12px;
+  }
   .options { margin-top: 18px; display: grid; gap: 8px; }
   .opt-btn {
     background: #fff; color: var(--ink); border: 1px solid var(--line);
@@ -186,12 +191,28 @@
   <!-- CALIBRATION INSTRUCTIONS -->
   <section class="screen" id="screen-calib-intro">
     <div class="card">
-      <h2>Calibration (about 1 minute)</h2>
-      <p>13 dots will appear one at a time, each for 5 seconds. Just
-         <strong>look steadily at each dot</strong> — no clicking needed. This teaches the
-         system to map your gaze to screen position for this seat and lighting.</p>
+      <h2>Calibration (about 20 seconds)</h2>
+      <p>A box will appear, the same size as the reading passage. Slowly
+         <strong>move your mouse back and forth across the whole box</strong> — left to
+         right, down a little, right to left, and so on — while keeping your
+         <strong>eyes locked on the cursor</strong> the entire time. This teaches the
+         system to map your gaze to screen position using exactly where you'll be reading.</p>
       <div class="btn-row">
         <button id="btn-start-calib">Start calibration</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- MOUSE-SWEEP CALIBRATION -->
+  <section class="screen" id="screen-mouse-calib">
+    <div class="card">
+      <h2>Move your mouse across the box below</h2>
+      <p>Cover the whole box, corners included — and keep your eyes on the cursor tip
+         the whole time, not ahead of it.</p>
+      <div class="progress" id="mouse-calib-progress">0s / 20s · 0 samples</div>
+      <div id="mouse-calib-box" style="min-height:320px; cursor:crosshair;"></div>
+      <div class="btn-row">
+        <button id="btn-finish-mouse-calib" class="secondary" disabled>Finish early</button>
       </div>
     </div>
   </section>
@@ -283,9 +304,6 @@ const CONFIG = {
   MODEL_ASSET_URL: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
   WASM_BASE_PATH: 'mediapipe-vision-wasm',
 
-  CALIBRATION_DWELL_MS: 5000,        // how long each calibration dot stays on screen
-  CALIBRATION_SETTLE_MS: 500,        // discard this much time after a dot appears — eyes are still moving toward it
-  CALIBRATION_SAMPLE_INTERVAL_MS: 120, // how often to add a training sample during dwell — safe to sample densely now, see README
   ACCURACY_THRESHOLD_PX: 200,
   ACCURACY_SETTLE_MS: 400,     // discard samples in this window after a target appears — eyes are still saccading toward it
   ACCURACY_SAMPLE_MS: 1200,    // then sample for this long
@@ -302,18 +320,19 @@ const CONFIG = {
   // (from the accuracy check), rather than to single words.
   CLUSTER_WIDTH_ERROR_FACTOR: 2,     // cluster width >= measured error * this factor
   CLUSTER_WIDTH_FLOOR_PX: 120,       // ...but never narrower than this, even with a great accuracy score
-  CLUSTER_HIT_MARGIN_PX: 30          // extra tolerance beyond a cluster's own rectangle before it's "off-passage"
-};
+  CLUSTER_HIT_MARGIN_PX: 30,         // extra tolerance beyond a cluster's own rectangle before it's "off-passage"
 
-// 13-point grid: the original 3x3 plus four inner quadrant points, for
-// denser coverage of the middle of the screen (where reading actually
-// happens) rather than just the edges.
-const CALIB_POINTS = [
-  [10,10],[50,10],[90,10],
-  [10,50],[50,50],[90,50],
-  [10,90],[50,90],[90,90],
-  [30,30],[70,30],[30,70],[70,70]
-];
+  // Smooth-pursuit calibration: the person moves their own mouse across a
+  // box (matching the passage's size/position) while keeping their eyes on
+  // the cursor. Ground truth is the live mouse position, sampled
+  // continuously — a well-established technique ("smooth pursuit
+  // calibration") that trades the old discrete-point approach for much
+  // denser coverage of exactly the screen region where reading happens.
+  MOUSE_CALIB_DURATION_MS: 20000,      // auto-finishes after this long
+  MOUSE_CALIB_MIN_TIME_MS: 5000,       // "Finish early" stays disabled until at least this long has passed
+  MOUSE_CALIB_MIN_SAMPLES: 80,         // reject and retry if fewer samples than this were collected
+  MOUSE_CALIB_MIN_COVERAGE_FRAC: 0.5   // ...or if the mouse covered less than this fraction of the box's width/height
+};
 
 // Accuracy is checked at multiple locations, not just the center — a model
 // that looks accurate in the middle of the screen can still be noticeably
@@ -543,7 +562,6 @@ const state = {
   learnerId: '',
   items: [],
   itemIndex: 0,
-  calibIndex: 0,
   gazeBuffer: [],       // {x,y,t} t = ms since passage shown, for the CURRENT item
   passageStartT: 0,
   wordEls: [],
@@ -635,74 +653,73 @@ continueBtn.addEventListener('click', async () => {
 });
 
 /* =========================================================================
-   CALIBRATION
+   CALIBRATION (smooth-pursuit: the person moves their own mouse across a
+   box while keeping their eyes on the cursor — see CONFIG for tuning)
    ========================================================================= */
 const calibOverlay = document.getElementById('calib-overlay');
 const calibHint = document.getElementById('calib-hint');
 
-document.getElementById('btn-start-calib').addEventListener('click', () => {
-  state.calibIndex = 0;
-  showCalibPoint();
-});
+document.getElementById('btn-start-calib').addEventListener('click', startMouseCalibration);
 
-function showCalibPoint() {
-  calibOverlay.classList.add('active');
-  // The webcam preview box sits in the bottom-right corner and can cover a
-  // calibration dot there — move it off-screen for the duration of
-  // calibration so every dot is guaranteed visible, then restore it
-  // afterward. (Moved off-screen rather than display:none — see the CSS
-  // comment on #video-preview-wrap.offscreen for why.)
-  document.getElementById('video-preview-wrap').classList.add('offscreen');
-  showScreen('screen-calib-intro'); // keep underlying screen consistent while overlay is up
-  document.querySelectorAll('.calib-dot').forEach(d => d.remove());
+function startMouseCalibration() {
+  showScreen('screen-mouse-calib');
+  calibrationSamples.length = 0;
+  calibModel = null;
 
-  if (state.calibIndex >= CALIB_POINTS.length) {
-    calibOverlay.classList.remove('active');
-    document.getElementById('video-preview-wrap').classList.remove('offscreen');
+  const box = document.getElementById('mouse-calib-box');
+  const finishBtn = document.getElementById('btn-finish-mouse-calib');
+  const progressEl = document.getElementById('mouse-calib-progress');
+  const startT = performance.now();
+  let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
+
+  finishBtn.disabled = true;
+
+  function onMove(e) {
+    addCalibrationSample(e.clientX, e.clientY);
+    xMin = Math.min(xMin, e.clientX); xMax = Math.max(xMax, e.clientX);
+    yMin = Math.min(yMin, e.clientY); yMax = Math.max(yMax, e.clientY);
+    updateProgress();
+  }
+  function updateProgress() {
+    const elapsedS = Math.round((performance.now() - startT) / 1000);
+    const totalS = Math.round(CONFIG.MOUSE_CALIB_DURATION_MS / 1000);
+    progressEl.textContent = `${elapsedS}s / ${totalS}s · ${calibrationSamples.length} samples`;
+  }
+
+  box.addEventListener('mousemove', onMove);
+  const enableFinishTimer = setTimeout(() => { finishBtn.disabled = false; }, CONFIG.MOUSE_CALIB_MIN_TIME_MS);
+  const autoFinishTimer = setTimeout(finish, CONFIG.MOUSE_CALIB_DURATION_MS);
+
+  finishBtn.onclick = finish;
+
+  function finish() {
+    clearTimeout(enableFinishTimer);
+    clearTimeout(autoFinishTimer);
+    box.removeEventListener('mousemove', onMove);
+    finishBtn.onclick = null;
+
+    const r = box.getBoundingClientRect();
+    const xCoverage = r.width ? (xMax - xMin) / r.width : 0;
+    const yCoverage = r.height ? (yMax - yMin) / r.height : 0;
+
+    if (calibrationSamples.length < CONFIG.MOUSE_CALIB_MIN_SAMPLES ||
+        xCoverage < CONFIG.MOUSE_CALIB_MIN_COVERAGE_FRAC ||
+        yCoverage < CONFIG.MOUSE_CALIB_MIN_COVERAGE_FRAC) {
+      alert('Not quite enough coverage yet. Please move your mouse across the FULL box — ' +
+        'including the corners and edges, not just the middle — a bit more.');
+      startMouseCalibration(); // retry from scratch
+      return;
+    }
+
     try {
       fitCalibrationModel();
     } catch (err) {
       alert('Calibration failed: ' + err.message + '\n\nPlease try again — make sure your face is clearly visible to the camera throughout.');
-      state.calibIndex = 0;
-      showCalibPoint();
+      startMouseCalibration();
       return;
     }
     startAccuracyCheck();
-    return;
   }
-
-  const [xPct, yPct] = CALIB_POINTS[state.calibIndex];
-  const dot = document.createElement('div');
-  dot.className = 'calib-dot';
-  dot.style.left = xPct + 'vw';
-  dot.style.top = yPct + 'vh';
-  dot.style.cursor = 'default';
-  calibHint.textContent = `Point ${state.calibIndex + 1} of ${CALIB_POINTS.length} — just look at the dot`;
-  calibOverlay.appendChild(dot);
-
-  // No physical click required: discard the settle window (eyes still
-  // moving toward the dot), then add a training sample at a steady interval
-  // for the rest of the dwell time, using the dot's exact center as ground
-  // truth. Unlike the old WebGazer version, there's no risk of "flooding"
-  // here — every sample from every point is collected into one array and
-  // used together in a single least-squares fit at the very end (see
-  // fitCalibrationModel), not fed into some opaque incremental model that
-  // could let later points crowd out earlier ones. More samples only helps.
-  setTimeout(() => {
-    const r = dot.getBoundingClientRect();
-    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-    const activeMs = CONFIG.CALIBRATION_DWELL_MS - CONFIG.CALIBRATION_SETTLE_MS;
-
-    const sampleInterval = setInterval(() => {
-      addCalibrationSample(cx, cy);
-    }, CONFIG.CALIBRATION_SAMPLE_INTERVAL_MS);
-
-    setTimeout(() => {
-      clearInterval(sampleInterval);
-      state.calibIndex++;
-      showCalibPoint();
-    }, activeMs);
-  }, CONFIG.CALIBRATION_SETTLE_MS);
 }
 
 /* =========================================================================
@@ -775,15 +792,9 @@ function finishAccuracyCheck() {
 document.getElementById('btn-accuracy-continue').addEventListener('click', () => {
   startItem();
 });
-document.getElementById('btn-accuracy-recalibrate').addEventListener('click', () => {
-  // Discard any samples/model from the previous attempt — otherwise a
-  // recalibration would blend old (possibly bad) data with the new pass,
-  // the same class of bug fixed earlier for cross-session persistence.
-  calibrationSamples.length = 0;
-  calibModel = null;
-  state.calibIndex = 0;
-  showCalibPoint();
-});
+document.getElementById('btn-accuracy-recalibrate').addEventListener('click', startMouseCalibration);
+// (startMouseCalibration() already clears calibrationSamples/calibModel itself,
+// so a recalibration never blends old, possibly-bad data with the new pass.)
 
 /* =========================================================================
    READING TASK
