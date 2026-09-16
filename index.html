@@ -573,22 +573,59 @@ function fitRidge(X, y, lambda) {
   return solveRidgeSystem(XtX, Xty, lambda);
 }
 
+// Ridge regression penalizes coefficient SIZE uniformly across features —
+// but our features are on very different natural scales (iris-in-socket
+// ratios are roughly 0-1; yaw/pitch/roll are radians, typically much
+// smaller in magnitude; nose position is normalized 0-1; inter-eye
+// distance is a different scale again). Without standardizing first, a
+// feature with naturally small variance needs a proportionally LARGER
+// coefficient to have the same predictive effect as a large-variance
+// feature — and ridge penalizes that large coefficient more, effectively
+// suppressing the low-variance feature's influence regardless of how
+// genuinely useful it is. This is exactly the kind of subtle statistical
+// gap that could leave a real, correctly-computed vertical-gaze signal
+// getting silently regularized away. Standardizing every feature to zero
+// mean / unit variance before fitting (and applying the same
+// transformation at prediction time) is standard practice for ridge
+// regression specifically because of this.
+function standardizeFeatures(samplesFeatures) {
+  const n = samplesFeatures.length, d = samplesFeatures[0].length;
+  const mean = new Array(d).fill(0);
+  for (const f of samplesFeatures) for (let j = 0; j < d; j++) mean[j] += f[j];
+  for (let j = 0; j < d; j++) mean[j] /= n;
+
+  const std = new Array(d).fill(0);
+  for (const f of samplesFeatures) for (let j = 0; j < d; j++) std[j] += (f[j] - mean[j]) ** 2;
+  for (let j = 0; j < d; j++) std[j] = Math.sqrt(std[j] / n) || 1e-6; // guard against a near-constant feature
+
+  return { mean, std };
+}
+function applyStandardization(features, mean, std) {
+  return features.map((v, j) => (v - mean[j]) / std[j]);
+}
+
 function fitCalibrationModel() {
   if (calibrationSamples.length < 15) {
     throw new Error('Not enough calibration data was collected (' + calibrationSamples.length + ' samples).');
   }
-  const X = calibrationSamples.map(s => [1, ...s.features]); // bias term + features
+  const rawFeatures = calibrationSamples.map(s => s.features);
+  const { mean, std } = standardizeFeatures(rawFeatures);
+
+  const X = rawFeatures.map(f => [1, ...applyStandardization(f, mean, std)]); // bias term + standardized features
   const yX = calibrationSamples.map(s => s.x);
   const yY = calibrationSamples.map(s => s.y);
   calibModel = {
     betaX: fitRidge(X, yX, CONFIG.RIDGE_LAMBDA),
-    betaY: fitRidge(X, yY, CONFIG.RIDGE_LAMBDA)
+    betaY: fitRidge(X, yY, CONFIG.RIDGE_LAMBDA),
+    featureMean: mean,
+    featureStd: std
   };
 }
 
 function predictFromFeatures(features) {
   if (!calibModel) return null;
-  const row = [1, ...features];
+  const standardized = applyStandardization(features, calibModel.featureMean, calibModel.featureStd);
+  const row = [1, ...standardized];
   const dot = (beta) => row.reduce((s, v, i) => s + v * beta[i], 0);
   return { x: dot(calibModel.betaX), y: dot(calibModel.betaY) };
 }
