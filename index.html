@@ -365,10 +365,12 @@ const EYE_LANDMARKS = {
   left:  { irisCenter: 473, cornerA: 362, cornerB: 263, lidTop: 386, lidBottom: 374 }
 };
 const NOSE_TIP_INDEX = 1;
-// Standard, widely-used landmark indices for a lightweight head-pitch proxy
-// (see extractFeatures below for why this was added).
-const FOREHEAD_INDEX = 10;
-const CHIN_INDEX = 152;
+// Landmarks used to build a head-orientation frame — same three points used
+// by the open-source EyeTrax project (github.com/ck-zhang/EyeTrax) for the
+// same purpose, ported here after checking their actual source: the two
+// outer eye corners plus a forehead point define a stable, easy-to-track
+// basis for "which way is the head currently facing."
+const POSE_FRAME = { leftCorner: 33, rightCorner: 263, topOfHead: 10 };
 
 let faceLandmarker = null;
 let trackingVideoEl = null;
@@ -379,11 +381,71 @@ let liveGazeListener = () => {}; // current consumer of per-frame predictions
 let lastFeatures = null;         // most recent frame's feature vector, read by addCalibrationSample()
 const calibrationSamples = []; // { features: number[], x: number, y: number }[]
 
+/* ---- tiny 3D vector helpers ---- */
+const v3 = {
+  sub: (a, b) => ({ x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }),
+  add: (a, b) => ({ x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }),
+  scale: (a, s) => ({ x: a.x * s, y: a.y * s, z: a.z * s }),
+  dot: (a, b) => a.x * b.x + a.y * b.y + a.z * b.z,
+  cross: (a, b) => ({ x: a.y * b.z - a.z * b.y, y: a.z * b.x - a.x * b.z, z: a.x * b.y - a.y * b.x }),
+  norm: (a) => {
+    const n = Math.hypot(a.x, a.y, a.z) || 1e-9;
+    return { x: a.x / n, y: a.y / n, z: a.z / n };
+  }
+};
+
+// Builds an orthonormal head-orientation frame from three stable landmarks
+// (same technique as EyeTrax) and returns a function that converts any
+// other landmark from camera coordinates into HEAD-RELATIVE coordinates —
+// i.e. "where is this point relative to the face itself," independent of
+// which way the head currently happens to be tilted toward the camera.
+// This is what actually fixes vertical-gaze tracking: previously, eye
+// features were measured directly in raw camera coordinates, so a head
+// tilt shifted them even when the eyes themselves hadn't moved relative to
+// the face. Also returns yaw/pitch/roll (extracted from this same
+// self-built frame, formulas ported directly from EyeTrax's source) and
+// the inter-eye distance in the head frame, for scale normalization.
+function buildHeadFrame(L) {
+  const leftCorner = L(POSE_FRAME.leftCorner);
+  const rightCorner = L(POSE_FRAME.rightCorner);
+  const topOfHead = L(POSE_FRAME.topOfHead);
+  const eyeCenter = v3.scale(v3.add(leftCorner, rightCorner), 0.5);
+
+  const xAxis = v3.norm(v3.sub(rightCorner, leftCorner));
+  const yApprox = v3.norm(v3.sub(topOfHead, eyeCenter));
+  const yAxis = v3.norm(v3.sub(yApprox, v3.scale(xAxis, v3.dot(yApprox, xAxis)))); // Gram-Schmidt against xAxis
+  const zAxis = v3.norm(v3.cross(xAxis, yAxis));
+
+  function toHeadFrame(p) {
+    const rel = v3.sub(p, eyeCenter);
+    return { x: v3.dot(rel, xAxis), y: v3.dot(rel, yAxis), z: v3.dot(rel, zAxis) };
+  }
+
+  const leftCornerH = toHeadFrame(leftCorner), rightCornerH = toHeadFrame(rightCorner);
+  const interEyeDist = Math.hypot(rightCornerH.x - leftCornerH.x, rightCornerH.y - leftCornerH.y) || 1e-7;
+
+  // Standard Euler-angle extraction from an orthonormal basis expressed as
+  // matrix columns [xAxis | yAxis | zAxis] — same formulas as EyeTrax.
+  const yaw = Math.atan2(xAxis.y, xAxis.x);
+  const pitch = Math.atan2(-xAxis.z, Math.hypot(yAxis.z, zAxis.z));
+  const roll = Math.atan2(yAxis.z, zAxis.z);
+
+  return { toHeadFrame, interEyeDist, yaw, pitch, roll };
+}
+
 function extractFeatures(landmarks) {
   const L = (i) => landmarks[i];
+  const frame = buildHeadFrame(L);
+
   function eyeFeature(cfg) {
-    const iris = L(cfg.irisCenter), a = L(cfg.cornerA), b = L(cfg.cornerB),
-          top = L(cfg.lidTop), bot = L(cfg.lidBottom);
+    // Same iris-within-eye-socket ratio as before, but now computed on
+    // HEAD-FRAME coordinates instead of raw camera coordinates — this is
+    // the actual fix for "tracks left/right but not up/down."
+    const iris = frame.toHeadFrame(L(cfg.irisCenter));
+    const a = frame.toHeadFrame(L(cfg.cornerA));
+    const b = frame.toHeadFrame(L(cfg.cornerB));
+    const top = frame.toHeadFrame(L(cfg.lidTop));
+    const bot = frame.toHeadFrame(L(cfg.lidBottom));
     const width = (b.x - a.x) || 1e-6, height = (bot.y - top.y) || 1e-6;
     return [(iris.x - a.x) / width, (iris.y - top.y) / height];
   }
@@ -391,22 +453,46 @@ function extractFeatures(landmarks) {
   const left = eyeFeature(EYE_LANDMARKS.left);
   const nose = L(NOSE_TIP_INDEX);
 
-  // Head-pitch proxy: people commonly look up/down at a screen partly (or
-  // mostly) by tilting their HEAD, not just rotating their eyes — and
-  // iris-within-eye-socket position alone barely changes when that
-  // happens, since the eyes themselves haven't moved much relative to the
-  // head. Without any signal for this, vertical gaze prediction can end up
-  // effectively blind while horizontal (much more often pure eye rotation)
-  // still works fine — exactly the "tracks left/right but not up/down"
-  // symptom this was added to fix. This is a simple, deliberately
-  // low-risk proxy (vertical forehead-to-chin distance in the camera's 2D
-  // projection, which changes characteristically as the head tilts) rather
-  // than a full 3D pitch angle decomposed from MediaPipe's facial
-  // transformation matrix — see the README for why, and where a more
-  // rigorous version would go if this proxy isn't enough on its own.
-  const pitchProxy = L(CHIN_INDEX).y - L(FOREHEAD_INDEX).y;
+  return [
+    ...right, ...left,
+    nose.x, nose.y,        // raw translation proxy (where the face sits in frame)
+    frame.interEyeDist,    // scale proxy (how close to the camera — replaces the old, less meaningful raw nose.z)
+    frame.yaw, frame.pitch, frame.roll  // properly-derived head orientation, replacing the earlier ad hoc pitch-only proxy
+  ];
+}
 
-  return [...right, ...left, nose.x, nose.y, nose.z, pitchProxy];
+/* ---- blink detection (eye-aspect-ratio, same technique as EyeTrax) ----
+   A blink briefly closes the eyelids, which produces a garbage eye-shape
+   reading — without filtering, a blink during calibration silently
+   corrupts that instant's training sample, and a blink during reading
+   silently corrupts that instant's gaze prediction. EAR (eye-aspect-ratio:
+   eye height / eye width) drops sharply during a blink; comparing against
+   a running average of *this session's own* recent EAR (rather than a
+   fixed threshold) adapts to individual eye shape and camera framing. */
+const EAR_HISTORY_MAX = 50;
+const EAR_BLINK_RATIO = 0.8;   // current EAR below (recent average * this) counts as a blink
+const EAR_MIN_HISTORY = 15;    // need at least this many readings before trusting the adaptive threshold
+let earHistory = [];
+
+function computeEAR(landmarks) {
+  const L = (i) => landmarks[i];
+  function eyeEAR(cfg) {
+    const a = L(cfg.cornerA), b = L(cfg.cornerB), top = L(cfg.lidTop), bot = L(cfg.lidBottom);
+    const width = Math.hypot(b.x - a.x, b.y - a.y) || 1e-9;
+    const height = Math.hypot(top.x - bot.x, top.y - bot.y);
+    return height / width;
+  }
+  return (eyeEAR(EYE_LANDMARKS.right) + eyeEAR(EYE_LANDMARKS.left)) / 2;
+}
+
+function isBlinking(landmarks) {
+  const ear = computeEAR(landmarks);
+  earHistory.push(ear);
+  if (earHistory.length > EAR_HISTORY_MAX) earHistory.shift();
+  const threshold = earHistory.length >= EAR_MIN_HISTORY
+    ? (earHistory.reduce((a, b) => a + b, 0) / earHistory.length) * EAR_BLINK_RATIO
+    : 0.2; // fixed fallback until there's enough history to trust an adaptive one
+  return ear < threshold;
 }
 
 /* ---- tiny matrix helpers, just enough for closed-form ridge regression ---- */
@@ -518,7 +604,20 @@ async function initTracking() {
       return;
     }
 
-    const features = extractFeatures(result.faceLandmarks[0]);
+    const landmarks = result.faceLandmarks[0];
+
+    if (isBlinking(landmarks)) {
+      // A blink briefly closes the eyelids — the eye-shape reading right
+      // now is garbage, not a real gaze signal. Treat this frame the same
+      // as "no face detected": skip it entirely rather than feed a bad
+      // reading into calibration or a prediction into the gaze stream.
+      liveDot.classList.remove('active');
+      liveGazeListener(null);
+      lastFeatures = null;
+      return;
+    }
+
+    const features = extractFeatures(landmarks);
     const raw = predictFromFeatures(features);
 
     // During calibration itself (before a model is fit), there's no
