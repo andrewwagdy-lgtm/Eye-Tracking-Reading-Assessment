@@ -112,6 +112,25 @@
   }
   #live-gaze-dot.active { display: block; }
 
+  /* On-demand recalibration: click a few times anywhere while looking at
+     the cursor, without leaving the reading task or redoing full
+     calibration. Opposite corner from the webcam preview so they never
+     overlap. Hidden until a calibration model actually exists (see
+     showScreen), and only shown on screens where "drift mid-use" is a
+     real concern. */
+  #btn-quick-fix {
+    position: fixed; bottom: 14px; left: 14px; z-index: 58;
+    display: none;
+  }
+  #quickfix-banner {
+    position: fixed; top: 14px; left: 50%; transform: translateX(-50%); z-index: 59;
+    background: var(--navy); color: #fff; padding: 10px 18px; border-radius: 8px;
+    font-size: 14px; box-shadow: 0 2px 10px rgba(0,0,0,.35);
+    display: none;
+  }
+  #quickfix-banner a { color: #ffd7b0; }
+  #quickfix-banner.active { display: block; }
+
   /* Reading passage */
   .passage {
     font-size: 24px; line-height: 4.2; word-spacing: 14px; padding: 22px;
@@ -280,6 +299,12 @@
 </div>
 <div id="video-preview-wrap"></div>
 <div id="live-gaze-dot"></div>
+<button id="btn-quick-fix" class="secondary">Fix tracking</button>
+<div id="quickfix-banner">
+  Look at your mouse cursor, then click anywhere —
+  <span id="quickfix-count">0</span> of <span id="quickfix-target"></span>
+  · <a href="#" id="quickfix-cancel">cancel</a>
+</div>
 
 <script type="module">
 import { FaceLandmarker, FilesetResolver } from './mediapipe-vision-wasm/vision_bundle.mjs';
@@ -328,7 +353,16 @@ const CONFIG = {
   PURSUIT_SETTLE_MS: 600,           // initial hold before the dot starts moving (lets eyes find it first)
   PURSUIT_CORNER_PAUSE_MS: 200,     // brief pause at each waypoint, not sampled — avoids capturing the corrective saccade at a sharp turn
   PURSUIT_MOVE_DURATION_MS: 16000,  // total time actually spent moving (excludes pauses)
-  PURSUIT_MIN_SAMPLES: 150          // sanity floor — if tracking dropped out for most of the run, retry rather than fit a bad model
+  PURSUIT_MIN_SAMPLES: 150,         // sanity floor — if tracking dropped out for most of the run, retry rather than fit a bad model
+
+  // On-demand recalibration ("Fix tracking" button): a few deliberate
+  // clicks, anywhere, while looking at the cursor. Each click is a genuine
+  // calibration sample, but with only a handful of clicks (vs. hundreds
+  // from the original pursuit sweep) it would barely move a least-squares
+  // fit built on that much existing data — so each click is added several
+  // times (QUICKFIX_SAMPLE_WEIGHT) to give it real corrective influence.
+  QUICKFIX_CLICKS_NEEDED: 5,
+  QUICKFIX_SAMPLE_WEIGHT: 10
 };
 
 // Accuracy is checked at multiple locations, not just the center — a model
@@ -696,12 +730,91 @@ function makeId() {
   return (crypto.randomUUID ? crypto.randomUUID() : 'sess-' + Date.now() + '-' + Math.random().toString(16).slice(2));
 }
 
+const QUICKFIX_ELIGIBLE_SCREENS = new Set(['screen-reading', 'screen-result']);
+
 function showScreen(id) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
+  // Only offer on-demand recalibration where "tracking might have drifted
+  // mid-use" is a real concern, and only once an initial calibration
+  // actually exists to correct.
+  document.getElementById('btn-quick-fix').style.display =
+    (calibModel && QUICKFIX_ELIGIBLE_SCREENS.has(id)) ? 'block' : 'none';
 }
 
 document.getElementById('session-badge').textContent = 'session ' + state.sessionId.slice(0, 8);
+
+/* =========================================================================
+   ON-DEMAND RECALIBRATION ("Fix tracking" button) — a lightweight repair
+   for drift noticed mid-use, without leaving the current screen or redoing
+   the full pursuit calibration. A deliberate, opt-in action (not a passive
+   "every click counts" listener) — this project specifically turned off
+   WebGazer's old passive click-learning earlier because it caused
+   problems; this is the same underlying idea done safely, as an explicit
+   exercise the person chooses to start.
+   ========================================================================= */
+let quickFixActive = false;
+
+document.getElementById('btn-quick-fix').addEventListener('click', startQuickFix);
+document.getElementById('quickfix-cancel').addEventListener('click', (e) => {
+  e.preventDefault();
+  if (quickFixActive) cancelQuickFix();
+});
+
+let quickFixCancel = null;
+
+function startQuickFix() {
+  if (quickFixActive || !calibModel) return;
+  quickFixActive = true;
+
+  let collected = 0;
+  const target = CONFIG.QUICKFIX_CLICKS_NEEDED;
+  const banner = document.getElementById('quickfix-banner');
+  const countEl = document.getElementById('quickfix-count');
+  document.getElementById('quickfix-target').textContent = target;
+  countEl.textContent = collected;
+  banner.classList.add('active');
+
+  function onClick(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    // Weighted, not a single sample: a handful of deliberate clicks need
+    // real influence against a least-squares fit already built on
+    // hundreds of pursuit-calibration samples, or they'd barely move it.
+    const before = calibrationSamples.length;
+    for (let i = 0; i < CONFIG.QUICKFIX_SAMPLE_WEIGHT; i++) {
+      addCalibrationSample(e.clientX, e.clientY);
+    }
+    if (calibrationSamples.length === before) return; // no face detected at that instant — don't count it, try again
+
+    collected++;
+    countEl.textContent = collected;
+    if (collected >= target) finish();
+  }
+  // Capture phase + stopPropagation: while active, clicks are consumed
+  // entirely as calibration corrections and never reach whatever's
+  // normally under the cursor (e.g. an answer button on the reading
+  // screen) — so "fixing tracking" can never accidentally also submit an
+  // answer or trigger anything else on the page.
+  document.addEventListener('click', onClick, true);
+
+  quickFixCancel = () => {
+    document.removeEventListener('click', onClick, true);
+    banner.classList.remove('active');
+    quickFixActive = false;
+    quickFixCancel = null;
+  };
+
+  function finish() {
+    const cancel = quickFixCancel;
+    if (cancel) cancel();
+    try { fitCalibrationModel(); } catch (err) { /* keep the previous model if this somehow fails */ }
+  }
+}
+
+function cancelQuickFix() {
+  if (quickFixCancel) quickFixCancel();
+}
 
 /* =========================================================================
    JSONP fetch of the item bank (avoids CORS entirely — see code.gs)
