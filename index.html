@@ -365,6 +365,10 @@ const EYE_LANDMARKS = {
   left:  { irisCenter: 473, cornerA: 362, cornerB: 263, lidTop: 386, lidBottom: 374 }
 };
 const NOSE_TIP_INDEX = 1;
+// Standard, widely-used landmark indices for a lightweight head-pitch proxy
+// (see extractFeatures below for why this was added).
+const FOREHEAD_INDEX = 10;
+const CHIN_INDEX = 152;
 
 let faceLandmarker = null;
 let trackingVideoEl = null;
@@ -386,7 +390,23 @@ function extractFeatures(landmarks) {
   const right = eyeFeature(EYE_LANDMARKS.right);
   const left = eyeFeature(EYE_LANDMARKS.left);
   const nose = L(NOSE_TIP_INDEX);
-  return [...right, ...left, nose.x, nose.y, nose.z];
+
+  // Head-pitch proxy: people commonly look up/down at a screen partly (or
+  // mostly) by tilting their HEAD, not just rotating their eyes — and
+  // iris-within-eye-socket position alone barely changes when that
+  // happens, since the eyes themselves haven't moved much relative to the
+  // head. Without any signal for this, vertical gaze prediction can end up
+  // effectively blind while horizontal (much more often pure eye rotation)
+  // still works fine — exactly the "tracks left/right but not up/down"
+  // symptom this was added to fix. This is a simple, deliberately
+  // low-risk proxy (vertical forehead-to-chin distance in the camera's 2D
+  // projection, which changes characteristically as the head tilts) rather
+  // than a full 3D pitch angle decomposed from MediaPipe's facial
+  // transformation matrix — see the README for why, and where a more
+  // rigorous version would go if this proxy isn't enough on its own.
+  const pitchProxy = L(CHIN_INDEX).y - L(FOREHEAD_INDEX).y;
+
+  return [...right, ...left, nose.x, nose.y, nose.z, pitchProxy];
 }
 
 /* ---- tiny matrix helpers, just enough for closed-form ridge regression ---- */
