@@ -120,7 +120,7 @@
   }
   .word { padding: 6px 4px; border-radius: 3px; }
 
-  #mouse-calib-box {
+  #pursuit-calib-box {
     border: 1px solid var(--line); border-radius: 8px; background: #fff;
     margin-top: 12px;
   }
@@ -192,28 +192,24 @@
   <section class="screen" id="screen-calib-intro">
     <div class="card">
       <h2>Calibration (about 20 seconds)</h2>
-      <p>A box will appear, the same size as the reading passage. Slowly
-         <strong>move your mouse back and forth across the whole box</strong> — left to
-         right, down a little, right to left, and so on — while keeping your
-         <strong>eyes locked on the cursor</strong> the entire time. This teaches the
-         system to map your gaze to screen position using exactly where you'll be reading.</p>
+      <p>A dot will move around a box the same size as the reading passage. Just
+         <strong>keep your eyes on the dot</strong> as it moves — no mouse, no clicking,
+         hands off entirely. This teaches the system to map your gaze to screen
+         position using exactly where you'll be reading.</p>
       <div class="btn-row">
         <button id="btn-start-calib">Start calibration</button>
       </div>
     </div>
   </section>
 
-  <!-- MOUSE-SWEEP CALIBRATION -->
-  <section class="screen" id="screen-mouse-calib">
+  <!-- SYSTEM-DRIVEN SMOOTH-PURSUIT CALIBRATION -->
+  <section class="screen" id="screen-pursuit-calib">
     <div class="card">
-      <h2>Move your mouse across the box below</h2>
-      <p>Cover the whole box, corners included — and keep your eyes on the cursor tip
-         the whole time, not ahead of it.</p>
-      <div class="progress" id="mouse-calib-progress">0s / 20s · 0 samples</div>
-      <div id="mouse-calib-box" style="min-height:320px; cursor:crosshair;"></div>
-      <div class="btn-row">
-        <button id="btn-finish-mouse-calib" class="secondary" disabled>Finish early</button>
-      </div>
+      <h2>Watch the moving dot</h2>
+      <p>Keep your eyes on the dot as it moves around the box below. No need to touch
+         your mouse — just watch.</p>
+      <div class="progress" id="pursuit-calib-progress">0% complete</div>
+      <div id="pursuit-calib-box" style="min-height:320px;"></div>
     </div>
   </section>
 
@@ -322,16 +318,17 @@ const CONFIG = {
   CLUSTER_WIDTH_FLOOR_PX: 120,       // ...but never narrower than this, even with a great accuracy score
   CLUSTER_HIT_MARGIN_PX: 30,         // extra tolerance beyond a cluster's own rectangle before it's "off-passage"
 
-  // Smooth-pursuit calibration: the person moves their own mouse across a
-  // box (matching the passage's size/position) while keeping their eyes on
-  // the cursor. Ground truth is the live mouse position, sampled
-  // continuously — a well-established technique ("smooth pursuit
-  // calibration") that trades the old discrete-point approach for much
-  // denser coverage of exactly the screen region where reading happens.
-  MOUSE_CALIB_DURATION_MS: 20000,      // auto-finishes after this long
-  MOUSE_CALIB_MIN_TIME_MS: 5000,       // "Finish early" stays disabled until at least this long has passed
-  MOUSE_CALIB_MIN_SAMPLES: 80,         // reject and retry if fewer samples than this were collected
-  MOUSE_CALIB_MIN_COVERAGE_FRAC: 0.5   // ...or if the mouse covered less than this fraction of the box's width/height
+  // System-driven smooth-pursuit calibration: a dot moves on its own in a
+  // zigzag across a box matching the passage's size/position; the person
+  // just watches it, hands off the mouse entirely. Ground truth is the
+  // dot's own known position at each instant — no coverage validation is
+  // needed the way the earlier mouse-driven version required, since the
+  // path is programmatically guaranteed to cover the whole box.
+  PURSUIT_ROWS: 6,                  // how many horizontal passes the zigzag makes
+  PURSUIT_SETTLE_MS: 600,           // initial hold before the dot starts moving (lets eyes find it first)
+  PURSUIT_CORNER_PAUSE_MS: 200,     // brief pause at each waypoint, not sampled — avoids capturing the corrective saccade at a sharp turn
+  PURSUIT_MOVE_DURATION_MS: 16000,  // total time actually spent moving (excludes pauses)
+  PURSUIT_MIN_SAMPLES: 150          // sanity floor — if tracking dropped out for most of the run, retry rather than fit a bad model
 };
 
 // Accuracy is checked at multiple locations, not just the center — a model
@@ -492,6 +489,12 @@ async function initTracking() {
     if (!result.faceLandmarks || !result.faceLandmarks.length) {
       liveDot.classList.remove('active');
       liveGazeListener(null);
+      // Don't leave lastFeatures pointing at a stale, pre-dropout reading —
+      // otherwise a calibration sample taken during a momentary tracking
+      // gap (a blink, a head turn) would pair OLD eye features with
+      // whatever the target's CURRENT position is, silently corrupting
+      // that one training sample.
+      lastFeatures = null;
       return;
     }
 
@@ -653,61 +656,116 @@ continueBtn.addEventListener('click', async () => {
 });
 
 /* =========================================================================
-   CALIBRATION (smooth-pursuit: the person moves their own mouse across a
-   box while keeping their eyes on the cursor — see CONFIG for tuning)
+   CALIBRATION (system-driven smooth-pursuit: a dot moves on its own in a
+   zigzag across a box the size of the reading passage; the person just
+   watches it with their eyes, hands off the mouse entirely — see CONFIG
+   for tuning)
    ========================================================================= */
 const calibOverlay = document.getElementById('calib-overlay');
 const calibHint = document.getElementById('calib-hint');
 
-document.getElementById('btn-start-calib').addEventListener('click', startMouseCalibration);
+document.getElementById('btn-start-calib').addEventListener('click', startPursuitCalibration);
 
-function startMouseCalibration() {
-  showScreen('screen-mouse-calib');
+function startPursuitCalibration() {
+  showScreen('screen-pursuit-calib');
   calibrationSamples.length = 0;
   calibModel = null;
 
-  const box = document.getElementById('mouse-calib-box');
-  const finishBtn = document.getElementById('btn-finish-mouse-calib');
-  const progressEl = document.getElementById('mouse-calib-progress');
-  const startT = performance.now();
-  let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
+  const box = document.getElementById('pursuit-calib-box');
+  const progressEl = document.getElementById('pursuit-calib-progress');
+  const r = box.getBoundingClientRect();
 
-  finishBtn.disabled = true;
-
-  function onMove(e) {
-    addCalibrationSample(e.clientX, e.clientY);
-    xMin = Math.min(xMin, e.clientX); xMax = Math.max(xMax, e.clientX);
-    yMin = Math.min(yMin, e.clientY); yMax = Math.max(yMax, e.clientY);
-    updateProgress();
-  }
-  function updateProgress() {
-    const elapsedS = Math.round((performance.now() - startT) / 1000);
-    const totalS = Math.round(CONFIG.MOUSE_CALIB_DURATION_MS / 1000);
-    progressEl.textContent = `${elapsedS}s / ${totalS}s · ${calibrationSamples.length} samples`;
+  // Build a zigzag path of waypoints covering the box, inset slightly from
+  // its edges so the dot never sits flush against the border.
+  const pad = 24;
+  const rows = CONFIG.PURSUIT_ROWS;
+  const leftX = r.left + pad, rightX = r.right - pad;
+  const waypoints = [];
+  for (let row = 0; row < rows; row++) {
+    const y = r.top + pad + (row / (rows - 1)) * (r.height - 2 * pad);
+    if (row % 2 === 0) waypoints.push({ x: leftX, y }, { x: rightX, y });
+    else waypoints.push({ x: rightX, y }, { x: leftX, y });
   }
 
-  box.addEventListener('mousemove', onMove);
-  const enableFinishTimer = setTimeout(() => { finishBtn.disabled = false; }, CONFIG.MOUSE_CALIB_MIN_TIME_MS);
-  const autoFinishTimer = setTimeout(finish, CONFIG.MOUSE_CALIB_DURATION_MS);
+  // Constant visual speed along the whole path (not equal time per segment)
+  // — otherwise short vertical drops between rows would look like sudden
+  // darts compared to the long horizontal sweeps.
+  const segLengths = [];
+  let totalLength = 0;
+  for (let i = 0; i < waypoints.length - 1; i++) {
+    const d = Math.hypot(waypoints[i + 1].x - waypoints[i].x, waypoints[i + 1].y - waypoints[i].y);
+    segLengths.push(d);
+    totalLength += d;
+  }
+  const speed = totalLength / CONFIG.PURSUIT_MOVE_DURATION_MS; // px per ms
 
-  finishBtn.onclick = finish;
+  const dot = document.createElement('div');
+  dot.className = 'calib-dot';
+  dot.style.cursor = 'default';
+  dot.style.position = 'fixed';
+  document.body.appendChild(dot);
+  function placeDot(x, y) { dot.style.left = x + 'px'; dot.style.top = y + 'px'; }
+  placeDot(waypoints[0].x, waypoints[0].y);
+
+  let phase = 'settle'; // 'settle' -> 'move' -> 'pause' -> 'move' -> ... -> done
+  let phaseStart = performance.now();
+  let segIndex = 0;
+  let movedLength = 0;
+  let rafId = null;
+
+  function tick(now) {
+    const elapsed = now - phaseStart;
+
+    if (phase === 'settle') {
+      if (elapsed >= CONFIG.PURSUIT_SETTLE_MS) { phase = 'move'; phaseStart = now; }
+      rafId = requestAnimationFrame(tick);
+      return;
+    }
+    if (phase === 'pause') {
+      if (elapsed >= CONFIG.PURSUIT_CORNER_PAUSE_MS) { phase = 'move'; phaseStart = now; }
+      rafId = requestAnimationFrame(tick);
+      return;
+    }
+
+    // phase === 'move'
+    const segLen = segLengths[segIndex];
+    const distIntoSegment = speed * elapsed;
+
+    if (distIntoSegment >= segLen) {
+      movedLength += segLen;
+      segIndex++;
+      placeDot(waypoints[segIndex].x, waypoints[segIndex].y);
+      progressEl.textContent = Math.round(100 * movedLength / totalLength) + '% complete';
+
+      if (segIndex >= waypoints.length - 1) { finish(); return; }
+      phase = 'pause';
+      phaseStart = now;
+      rafId = requestAnimationFrame(tick);
+      return;
+    }
+
+    const t = distIntoSegment / segLen;
+    const a = waypoints[segIndex], b = waypoints[segIndex + 1];
+    const x = a.x + (b.x - a.x) * t;
+    const y = a.y + (b.y - a.y) * t;
+    placeDot(x, y);
+    addCalibrationSample(x, y); // the dot's own known position IS the ground truth
+    rafId = requestAnimationFrame(tick);
+  }
+  rafId = requestAnimationFrame(tick);
 
   function finish() {
-    clearTimeout(enableFinishTimer);
-    clearTimeout(autoFinishTimer);
-    box.removeEventListener('mousemove', onMove);
-    finishBtn.onclick = null;
+    cancelAnimationFrame(rafId);
+    dot.remove();
 
-    const r = box.getBoundingClientRect();
-    const xCoverage = r.width ? (xMax - xMin) / r.width : 0;
-    const yCoverage = r.height ? (yMax - yMin) / r.height : 0;
-
-    if (calibrationSamples.length < CONFIG.MOUSE_CALIB_MIN_SAMPLES ||
-        xCoverage < CONFIG.MOUSE_CALIB_MIN_COVERAGE_FRAC ||
-        yCoverage < CONFIG.MOUSE_CALIB_MIN_COVERAGE_FRAC) {
-      alert('Not quite enough coverage yet. Please move your mouse across the FULL box — ' +
-        'including the corners and edges, not just the middle — a bit more.');
-      startMouseCalibration(); // retry from scratch
+    // No coverage check needed here (unlike the old mouse-driven version)
+    // — the path above is programmatically guaranteed to cover the whole
+    // box. Only a minimum sample count, as a sanity check that tracking
+    // didn't drop out (e.g. camera/lighting issue) for most of the run.
+    if (calibrationSamples.length < CONFIG.PURSUIT_MIN_SAMPLES) {
+      alert('Tracking dropped out too much during calibration to get a good result.\n\n' +
+        'Please try again — make sure your face stays clearly visible to the camera throughout.');
+      startPursuitCalibration();
       return;
     }
 
@@ -715,7 +773,7 @@ function startMouseCalibration() {
       fitCalibrationModel();
     } catch (err) {
       alert('Calibration failed: ' + err.message + '\n\nPlease try again — make sure your face is clearly visible to the camera throughout.');
-      startMouseCalibration();
+      startPursuitCalibration();
       return;
     }
     startAccuracyCheck();
@@ -792,8 +850,8 @@ function finishAccuracyCheck() {
 document.getElementById('btn-accuracy-continue').addEventListener('click', () => {
   startItem();
 });
-document.getElementById('btn-accuracy-recalibrate').addEventListener('click', startMouseCalibration);
-// (startMouseCalibration() already clears calibrationSamples/calibModel itself,
+document.getElementById('btn-accuracy-recalibrate').addEventListener('click', startPursuitCalibration);
+// (startPursuitCalibration() already clears calibrationSamples/calibModel itself,
 // so a recalibration never blends old, possibly-bad data with the new pass.)
 
 /* =========================================================================
